@@ -35,7 +35,7 @@ jobs:
         # `npm ci`, and this step caches THAT path across CI runs (keyed to
         # the lockfile so a dependency bump busts the cache automatically),
         # avoiding a fresh ~200MB mongod download every single run.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/mongodb-binaries
           key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
