@@ -1,0 +1,106 @@
+name: Cron (production background jobs)
+
+# Invokes this project's serverless background-job endpoints on a schedule
+# (docs/PRODUCTION_READINESS.md §14). These exist because the chosen
+# deployment target — Vercel — cannot run `scripts/process-orders.ts` /
+# `poll-order-status.ts` / `compute-delivery-estimates.ts` as long-lived
+# processes at all (serverless functions don't persist between requests;
+# see `lib/services/jobs.ts` for the extracted shared logic those scripts
+# and these HTTP endpoints both call).
+#
+# Why GitHub Actions instead of Vercel's own native Cron Jobs: Vercel Cron
+# only supports once-per-day schedules (imprecise, within-the-hour) on the
+# free Hobby plan — per-minute schedules require a Pro plan ($20/mo). This
+# project stays on Hobby and uses this repo's own CI infrastructure as the
+# external scheduler instead. Trade-off, accepted deliberately (see
+# .claude/plans/production-hardening-observability-cd.plan.md): GitHub
+# Actions' `schedule` trigger has a documented 5-minute minimum interval,
+# is best-effort (can be delayed, especially near common cron boundaries
+# like the top of the hour — schedules below are deliberately offset to
+# avoid that), and is not a guaranteed-real-time trigger. This is
+# acceptable for this app's actual throughput: the underlying jobs were
+# never a hard-real-time design (see docs/ARCHITECTURE.md's own "simple
+# polling worker, not a fault-tolerant distributed queue" framing), and
+# each job is idempotent/safe to run late or occasionally skip a cycle —
+# the next run just picks up whatever's still eligible.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   PROD_URL     - e.g. https://your-panel.vercel.app (no trailing slash)
+#   CRON_SECRET  - must match the CRON_SECRET env var configured on Vercel
+#
+# Manually trigage via the Actions tab (workflow_dispatch) to test without
+# waiting for a scheduled run, or to run a job on demand (e.g. right after
+# fixing a stuck-orders incident — see docs/INCIDENT_RESPONSE.md §6.2).
+on:
+  schedule:
+    # Dispatch new/retrying orders — most time-sensitive of the three, runs
+    # most often. Offset from the exact 5-minute boundary (`*/5`) to avoid
+    # GitHub's documented extra delay at popular cron times.
+    - cron: "2-59/5 * * * *"
+    # Poll IN_PROGRESS orders for status updates — lib/services/jobs.ts's
+    # own MIN_RECHECK_INTERVAL_MS (2 min) already caps how often any single
+    # order is actually re-checked regardless of how often this fires, so
+    # a slightly less frequent schedule than process-orders is sufficient.
+    - cron: "4,9,14,19,24,29,34,39,44,49,54,59 * * * *"
+    # Recompute per-service delivery estimates — cheap, low-urgency, hourly
+    # is plenty (matches the original script's own --loop cadence).
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Which job to run (leave as 'all' for a manual full pass)"
+        type: choice
+        options: ["all", "process-orders", "poll-order-status", "compute-delivery-estimates"]
+        default: "all"
+
+jobs:
+  process-orders:
+    name: Process orders
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'process-orders') || (github.event_name == 'schedule' && github.event.schedule == '2-59/5 * * * *')
+    steps:
+      - name: Call /api/cron/process-orders
+        run: |
+          status=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.PROD_URL }}/api/cron/process-orders")
+          cat /tmp/body.json
+          echo ""
+          if [ "$status" -ge 300 ]; then
+            echo "::error::process-orders returned HTTP $status"
+            exit 1
+          fi
+
+  poll-order-status:
+    name: Poll order status
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'poll-order-status') || (github.event_name == 'schedule' && github.event.schedule == '4,9,14,19,24,29,34,39,44,49,54,59 * * * *')
+    steps:
+      - name: Call /api/cron/poll-order-status
+        run: |
+          status=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.PROD_URL }}/api/cron/poll-order-status")
+          cat /tmp/body.json
+          echo ""
+          if [ "$status" -ge 300 ]; then
+            echo "::error::poll-order-status returned HTTP $status"
+            exit 1
+          fi
+
+  compute-delivery-estimates:
+    name: Compute delivery estimates
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'compute-delivery-estimates') || (github.event_name == 'schedule' && github.event.schedule == '7 * * * *')
+    steps:
+      - name: Call /api/cron/compute-delivery-estimates
+        run: |
+          status=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.PROD_URL }}/api/cron/compute-delivery-estimates")
+          cat /tmp/body.json
+          echo ""
+          if [ "$status" -ge 300 ]; then
+            echo "::error::compute-delivery-estimates returned HTTP $status"
+            exit 1
+          fi

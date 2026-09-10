@@ -1,0 +1,150 @@
+name: Post-deploy smoke test
+
+# Runs after a Vercel deployment completes (docs/PRODUCTION_READINESS.md
+# §14). Deliberately does NOT re-implement Vercel's own build/deploy
+# pipeline here — Vercel's native GitHub integration (connect the repo in
+# the Vercel dashboard, no extra workflow needed) already builds and
+# deploys on every push to `main`, gated by this repo's own `ci.yml`
+# quality job via Vercel's "Wait for CI to pass before deploying" project
+# setting (configure that in the Vercel dashboard: Project Settings ->
+# Git -> "Ignored Build Step" / deployment protection, or the CI-gating
+# option under Git integration — this repo's `ci.yml` is what that gate
+# waits on). Re-implementing `vercel pull && vercel build && vercel
+# deploy --prebuilt` in a second workflow here would be pure duplication
+# of what Vercel's own integration already does correctly.
+#
+# What THIS workflow adds on top: a real HTTP smoke test against the
+# just-deployed URL, closing the specific gap
+# docs/PRODUCTION_READINESS.md §14 called out ("no automated smoke test
+# post-deploy, no automated rollback"). It curls `GET /api/health`
+# (`app/api/health/route.ts`) and fails loudly if it doesn't return 200 —
+# simple, but it directly catches the most common real-world post-deploy
+# failure mode for this app: a missing/misconfigured env var (MONGODB_URI,
+# AUTH_SECRET, etc.) that only surfaces once the new deployment actually
+# tries to connect to the database, which `next build` alone can't catch.
+#
+# Triggered by GitHub's `deployment_status` event, which Vercel's GitHub
+# integration emits automatically for every deployment it creates — no
+# extra Vercel-side webhook configuration needed beyond having the
+# repo connected to a Vercel project in the first place.
+on:
+  deployment_status:
+
+jobs:
+  smoke-test:
+    name: Smoke test (GET /api/health)
+    runs-on: ubuntu-latest
+    # Only for Vercel's own deployments reaching a final "success" state,
+    # and only for Production (this repo has no separate GitHub
+    # Environment for Preview deployments configured — Preview URLs are
+    # also fine to leave unchecked here, since they don't serve real
+    # traffic and a broken preview is caught by a human reviewing the PR).
+    if: github.event.deployment_status.state == 'success' && github.event.deployment.environment == 'production'
+    steps:
+      - name: Curl the deployed health endpoint
+        env:
+          DEPLOY_URL: ${{ github.event.deployment_status.target_url }}
+        run: |
+          echo "Checking $DEPLOY_URL/api/health ..."
+          status=$(curl -sS -o /tmp/health.json -w "%{http_code}" "$DEPLOY_URL/api/health")
+          cat /tmp/health.json
+          echo ""
+          if [ "$status" != "200" ]; then
+            echo "::error::Post-deploy health check failed with HTTP $status. See docs/INCIDENT_RESPONSE.md §6.1 (site fully down) if this is a real production deploy — consider an immediate rollback from the Vercel dashboard."
+            exit 1
+          fi
+          echo "Health check OK ($status)."
+
+      # Closes the other half of the docs/PRODUCTION_READINESS.md §14 gap
+      # ("no automated rollback"). Off by default — this mutates live
+      # production traffic, so it only runs once a human has deliberately
+      # opted in via the AUTO_ROLLBACK_ENABLED repository variable (Settings
+      # -> Secrets and variables -> Actions -> Variables tab, not Secrets).
+      # Requires three repository *secrets* (Settings -> Secrets and
+      # variables -> Actions -> Secrets):
+      #   VERCEL_TOKEN      - Account Settings -> Tokens -> Create Token
+      #                       (scope it to this project if possible).
+      #   VERCEL_PROJECT_ID - Project Settings -> General -> Project ID.
+      #   VERCEL_TEAM_ID    - Team Settings -> General -> Team ID. Only
+      #                       needed if the project lives under a Vercel
+      #                       Team rather than a personal account; leave
+      #                       unset otherwise.
+      # Uses Vercel's REST API directly (no CLI install needed):
+      #   GET  /v7/deployments  - list recent production deployments
+      #   POST /v1/projects/{projectId}/rollback/{deploymentId} - revert
+      #        production traffic to a specific prior deployment
+      # Docs: https://vercel.com/docs/rest-api/deployments/list-deployments
+      #       https://vercel.com/docs/rest-api/projects/point-production-traffic-to-a-previous-production-deployment-by-id
+      # This logic has been reviewed against Vercel's published API
+      # reference but could NOT be exercised against a real Vercel project
+      # from this environment (no live Vercel account/token available) —
+      # test it against a real (ideally non-production) project before
+      # relying on it, and watch the first real trigger closely.
+      - name: Attempt automated rollback (Vercel)
+        if: failure()
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+          ROLLBACK_ENABLED: ${{ vars.AUTO_ROLLBACK_ENABLED }}
+          FAILED_DEPLOY_URL: ${{ github.event.deployment_status.target_url }}
+        run: |
+          set -u
+
+          if [ "${ROLLBACK_ENABLED:-}" != "true" ]; then
+            echo "::warning::Automated rollback is disabled (repository variable AUTO_ROLLBACK_ENABLED is not set to 'true'). Skipping automated rollback. Roll back manually from the Vercel dashboard now if this is a real production incident — see docs/INCIDENT_RESPONSE.md §6.1."
+            exit 0
+          fi
+
+          if [ -z "${VERCEL_TOKEN:-}" ] || [ -z "${VERCEL_PROJECT_ID:-}" ]; then
+            echo "::error::AUTO_ROLLBACK_ENABLED is 'true' but the VERCEL_TOKEN and/or VERCEL_PROJECT_ID repository secrets are missing, so automated rollback cannot run. Roll back manually from the Vercel dashboard now — see docs/INCIDENT_RESPONSE.md §6.1. Add the missing secret(s) before the next deploy."
+            exit 1
+          fi
+
+          team_qs=""
+          if [ -n "${VERCEL_TEAM_ID:-}" ]; then
+            team_qs="&teamId=${VERCEL_TEAM_ID}"
+          fi
+
+          echo "Looking up the last known-good production deployment for project $VERCEL_PROJECT_ID ..."
+          http_status=$(curl -sS -o /tmp/deployments.json -w "%{http_code}" \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v7/deployments?projectId=${VERCEL_PROJECT_ID}&target=production&limit=10${team_qs}")
+
+          if [ "$http_status" != "200" ]; then
+            echo "::error::Vercel API call to list deployments failed (HTTP $http_status). Cannot automatically determine a rollback target. Roll back manually from the Vercel dashboard now — see docs/INCIDENT_RESPONSE.md §6.1."
+            cat /tmp/deployments.json
+            exit 1
+          fi
+
+          # Deployments are returned newest-first. Explicitly exclude the
+          # deployment this workflow just smoke-tested (matched by
+          # hostname, not just list position — position alone is not
+          # reliable if Vercel's own isRollbackCandidate flag has already
+          # excluded the failing deployment from that state) and take the
+          # newest remaining one that is READY and rollback-eligible.
+          failed_host=$(echo "$FAILED_DEPLOY_URL" | sed -E 's#^https?://##')
+          candidate_id=$(jq -r --arg host "$failed_host" \
+            '[.deployments[] | select(.url != $host) | select((.state == "READY" or .readyState == "READY") and (.isRollbackCandidate != false))] | .[0].uid // empty' \
+            /tmp/deployments.json)
+
+          if [ -z "$candidate_id" ]; then
+            echo "::error::Could not find a previous READY, rollback-eligible production deployment. Automated rollback skipped. Roll back manually from the Vercel dashboard now — see docs/INCIDENT_RESPONSE.md §6.1."
+            jq '[.deployments[] | {uid, state, readyState, target, isRollbackCandidate, created}]' /tmp/deployments.json 2>/dev/null || cat /tmp/deployments.json
+            exit 1
+          fi
+
+          echo "Rolling back production traffic to deployment $candidate_id ..."
+          rollback_status=$(curl -sS -o /tmp/rollback.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v1/projects/${VERCEL_PROJECT_ID}/rollback/${candidate_id}?description=automated-rollback-failed-smoke-test${team_qs}")
+          cat /tmp/rollback.json
+          echo ""
+
+          if [ "$rollback_status" = "200" ] || [ "$rollback_status" = "201" ]; then
+            echo "::error::Post-deploy smoke test failed, so production traffic was AUTOMATICALLY ROLLED BACK to deployment $candidate_id (HTTP $rollback_status). Verify the rollback in the Vercel dashboard, then open an incident per docs/INCIDENT_RESPONSE.md."
+            exit 0
+          else
+            echo "::error::Post-deploy smoke test failed AND the automated rollback request also failed (HTTP $rollback_status). Manual rollback is required immediately — see docs/INCIDENT_RESPONSE.md §6.1."
+            exit 1
+          fi

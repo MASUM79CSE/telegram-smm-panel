@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # npm dependencies (package.json / package-lock.json)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # Batch low-risk patch/minor updates into a single PR per week
+      # instead of one PR per package, so review load stays manageable;
+      # major version bumps (which can be breaking, e.g. Next.js/React/
+      # Mongoose/NextAuth major releases) are deliberately NOT grouped —
+      # each gets its own PR requiring individual review.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions versions used in .github/workflows/*.yml
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci)"

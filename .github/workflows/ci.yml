@@ -1,0 +1,95 @@
+name: CI
+
+# Runs quality gates on every push/PR: type safety, lint, unit tests, a
+# DB-backed integration suite (see docs/ARCHITECTURE.md "Testing" section
+# for scope — the integration suite spins up a real, ephemeral MongoDB
+# replica set via mongodb-memory-server and exercises the actual
+# transactional order/deposit/refund logic end-to-end), a production
+# build, and finally a real-browser Playwright end-to-end suite that runs
+# that same build against its own separate ephemeral MongoDB replica set
+# (see e2e/global-setup.ts and docs/PRODUCTION_READINESS.md §15 — this
+# closes what was the last remaining gap tracked there).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    name: Typecheck, Lint, Test, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Cache mongodb-memory-server binary
+        # `npm ci` always deletes and reinstalls node_modules from scratch,
+        # which would wipe mongodb-memory-server's DEFAULT download cache
+        # (node_modules/.cache/...) on every run — so MONGOMS_DOWNLOAD_DIR
+        # below redirects it to a path outside node_modules that survives
+        # `npm ci`, and this step caches THAT path across CI runs (keyed to
+        # the lockfile so a dependency bump busts the cache automatically),
+        # avoiding a fresh ~200MB mongod download every single run.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Dependency vulnerability scan
+        run: npm audit --audit-level=high
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Integration tests (DB-backed, via mongodb-memory-server)
+        # Downloads a real mongod binary on first run into the path cached
+        # above; subsequent runs reuse it. If a runner ever has no network
+        # access to download it at all, see
+        # https://github.com/typegoose/mongodb-memory-server for
+        # self-hosted binary / mirror options.
+        env:
+          MONGOMS_DOWNLOAD_DIR: /home/runner/.cache/mongodb-binaries
+        run: npm run test:integration
+
+      - name: Build
+        # Dummy env values so `next build` (which loads lib/env.ts at import
+        # time for some routes) doesn't fail validation in CI. These are not
+        # real secrets and are never used to contact a real service.
+        env:
+          MONGODB_URI: "mongodb://localhost:27017/ci-placeholder"
+          AUTH_SECRET: "ci-only-placeholder-secret-not-for-real-use-000000"
+          AUTH_TRUST_HOST: "true"
+          NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+          NODE_ENV: "production"
+        run: npm run build
+
+      - name: Install Playwright's Chromium browser
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests (Playwright, against the just-built app)
+        # `e2e/global-setup.ts` spawns its own ephemeral MongoDB replica set
+        # (mongodb-memory-server, reusing the binary cached above) and its
+        # own `next start` server process with its own env vars (a fresh
+        # MONGODB_URI pointed at that replica set, throwaway AUTH_SECRET,
+        # etc. — see that file's header comment) — nothing from the Build
+        # step's placeholder env above is reused here, and nothing this
+        # step does touches a real database or external service. The build
+        # from the previous step is reused as-is (see docs/PRODUCTION_
+        # READINESS.md §15 for why `config.webServer` isn't used).
+        env:
+          MONGOMS_DOWNLOAD_DIR: /home/runner/.cache/mongodb-binaries
+        run: npx playwright test

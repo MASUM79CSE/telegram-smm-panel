@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root {
+  --background: #020617;
+  --foreground: #f1f5f9;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* Small, dependency-free entrance animation used by dropdown/menu-style
+   popovers (e.g. the locale switcher) — Tailwind v4's core doesn't ship
+   `tailwindcss-animate`'s `animate-in`/`fade-in`/`slide-in-*` utilities, so
+   this is a minimal real equivalent rather than pulling in another
+   dependency for a handful of keyframes. */
+@keyframes panel-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-panel-pop-in {
+  animation: panel-pop-in 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Subtle animated gradient used for premium accent surfaces (hero glow,
+   platform icon chips) — real CSS, not a static image. */
+@keyframes gradient-shift {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+.animate-gradient-shift {
+  background-size: 200% 200%;
+  animation: gradient-shift 6s ease infinite;
+}
