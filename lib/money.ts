@@ -21,7 +21,21 @@ const SCALE = 4; // matches the original convention: Decimal(18, 4) columns
 export type Money = Prisma.Decimal;
 
 export function toDecimal128(value: number | string | Money): Money {
-  if (value instanceof Prisma.Decimal) return value.toDecimalPlaces(SCALE);
+  // Deliberately `Prisma.Decimal.isDecimal(value)` rather than
+  // `value instanceof Prisma.Decimal`: Next.js/Turbopack can bundle the
+  // generated Prisma client (lib/generated/prisma) into more than one
+  // independent server chunk, each getting its own copy of the
+  // decimal.js `Decimal` class. A real Decimal value created via one
+  // chunk's copy then fails an `instanceof` check performed against
+  // another chunk's copy of the *same* class, even though it's a
+  // perfectly valid Decimal — this was caught live via a production
+  // build + Playwright e2e run throwing "Invalid numeric value for
+  // money field" on deposit approval / order placement despite unit
+  // tests (which don't go through a real Next.js bundler) passing.
+  // `Decimal.isDecimal()` is decimal.js's own cross-copy-safe check
+  // (falls back to a `Symbol.toStringTag`/duck-typing comparison, see
+  // decimal.js's `isDecimalInstance()`), so use that instead.
+  if (Prisma.Decimal.isDecimal(value)) return (value as Money).toDecimalPlaces(SCALE);
   const num = typeof value === "string" ? parseFloat(value) : value;
   if (!Number.isFinite(num)) throw new Error("Invalid numeric value for money field");
   return new Prisma.Decimal(num.toFixed(SCALE));

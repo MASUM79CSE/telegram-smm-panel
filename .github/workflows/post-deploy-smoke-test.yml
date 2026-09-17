@@ -19,8 +19,8 @@ name: Post-deploy smoke test
 # post-deploy, no automated rollback"). It curls `GET /api/health`
 # (`app/api/health/route.ts`) and fails loudly if it doesn't return 200 —
 # simple, but it directly catches the most common real-world post-deploy
-# failure mode for this app: a missing/misconfigured env var (MONGODB_URI,
-# AUTH_SECRET, etc.) that only surfaces once the new deployment actually
+# failure mode for this app: a missing/misconfigured env var (DATABASE_URL,
+# DIRECT_URL, AUTH_SECRET, etc.) that only surfaces once the new deployment actually
 # tries to connect to the database, which `next build` alone can't catch.
 #
 # Triggered by GitHub's `deployment_status` event, which Vercel's GitHub
