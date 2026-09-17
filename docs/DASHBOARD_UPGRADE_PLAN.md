@@ -1,5 +1,7 @@
 # Dashboard Upgrade Plan — Admin Panel & Customer Dashboard (Phase 5)
 
+> **Migration history note:** this document was implemented and verified against this project's **original MongoDB Atlas/Mongoose backend** — references to Mongo aggregation pipelines, "MongoDB Atlas data," raw Mongoose `CastError` messages, and populated Mongoose documents all reflect that, and are left as an accurate historical record rather than rewritten to describe the current Postgres/Prisma system (which didn't exist yet at the time this phase shipped). The project has since been fully migrated to PostgreSQL/Prisma (Supabase) — see [`DATABASE.md`](DATABASE.md) for the current schema/mechanics. The equivalent of a "Mongo aggregation pipeline" today is a Prisma `groupBy`/raw SQL query against the same `Transaction`/`Order` tables; every reporting query this plan describes was carried over to the new schema with equivalent (not identical-syntax) queries.
+
 This is a dedicated planning doc for a dashboard-focused improvement pass,
 requested directly by the project owner: "advanced, all-in-one" admin
 dashboard/panel, plus a richer post-login customer dashboard. It follows the

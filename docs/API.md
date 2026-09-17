@@ -1,6 +1,6 @@
 # Reseller API (`/api/v2`)
 
-**Status:** shipped in `docs/IMPLEMENTATION_PLAN.md` Phase 2.2, live-verified against real MongoDB Atlas data (see that section for the verification log).
+**Status:** shipped in `docs/IMPLEMENTATION_PLAN.md` Phase 2.2, live-verified at the time against real MongoDB Atlas data (see that section for the verification log — the project has since been fully migrated to PostgreSQL/Prisma via Supabase, see [`DATABASE.md`](DATABASE.md); this endpoint's contract/behavior is unchanged by that migration).
 
 This is a **reseller-facing HTTP API** for third parties (or your own scripts/bots) to place orders, check status, and manage balance programmatically, without a browser session. It deliberately follows the same request/response contract used by the wider "SMM panel API v2" ecosystem (the shape shared by every reference panel researched while building this — see the note on conventions below), so existing reseller integration scripts generally work against this endpoint with only a base-URL change.
 
@@ -52,7 +52,7 @@ Returns the exact same underlying catalog data as the public website (`lib/servi
 ]
 ```
 
-`service` is this platform's MongoDB ObjectId string for the service (not a small sequential integer, unlike some reference panels) — use it verbatim as the `service` parameter in `add`.
+`service` is this platform's UUID string primary key for the service (not a small sequential integer, unlike some reference panels) — use it verbatim as the `service` parameter in `add`.
 
 ### `add` — place an order
 

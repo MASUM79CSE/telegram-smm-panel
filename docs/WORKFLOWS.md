@@ -6,9 +6,9 @@ This document traces concrete request/data lifecycles through the system, from a
 
 1. `next dev` / `next start` boots the Next.js server.
 2. On the **first** module that imports `lib/env.ts`'s `env` proxy (or calls `getEnv()` directly), the full `process.env` is parsed against a Zod schema. If any required variable is missing/invalid, or `NODE_ENV=production` and `AUTH_SECRET` still contains the example placeholder string, the process throws immediately with a formatted list of every failing field — this happens **before** the app serves any request, by design (fail fast, not on the first user's request). A related but non-fatal check also warns at this point if `NODE_ENV=production` and `AUTH_TRUST_HOST` isn't `true` — this doesn't stop startup (unlike the checks above) because it depends on the deployment's networking setup, but every auth-related request will fail with `UntrustedHost` until it's set; see [`../README.md` §11](../README.md#11-production-setup--operational-requirements).
-3. `lib/db.ts` does **not** connect eagerly at import time — `connectDB()` is called lazily on the first request/script that needs the database (e.g. inside a route handler, inside `auth()`'s `authorize` callback, or explicitly at the top of every `scripts/*.ts` entry point). The resulting connection is cached on `global.__mongooseCache` so subsequent calls (including across Next.js dev-mode hot reloads and serverless re-invocations) reuse it instead of opening a new connection each time.
-4. `connectDB()` imports `models/index.ts` as a side effect the first time it's called, which registers every Mongoose model (`User`, `Order`, `Wallet`, ...) on the shared connection — this exists so that a route which only directly imports, say, `models/Order.ts` but `.populate("serviceId")` (a ref to `Service`) doesn't hit Mongoose's "Schema hasn't been registered for model Service" error just because it never explicitly imported `models/Service.ts` itself.
-5. If the Telegram bot integration is enabled (`TELEGRAM_BOT_TOKEN` set), the bot instance itself is **also** lazily constructed — the first inbound webhook request (or the explicit `scripts/run-bot-polling.ts` script) triggers `getBot()`, which connects to MongoDB (reusing the same cached connection), sets up grammY session storage backed by a `telegram_bot_sessions` collection, and registers command handlers exactly once per server process (`registered` flag guard in `lib/telegram/bot.ts`).
+3. `lib/db.ts` does **not** connect eagerly at import time — the exported `prisma` client is a lazily-constructed `Proxy` (built on first actual property access, not at import time), and `connectDB()` (a historical name kept for a smooth migration — every old call site that used to `await connectDB()` before running a Mongoose query still works unchanged) explicitly calls `$connect()` on it. The resulting `PrismaClient` instance is cached on `global.__prismaClient` so subsequent calls (including across Next.js dev-mode hot reloads) reuse it instead of constructing a new client each time; see `lib/db.ts`'s own header comment for why this must stay lazy (importing `@/lib/db` must never itself force `lib/env.ts`'s environment validation for a route that never ends up touching the database).
+4. Every table declared in `prisma/schema.prisma` is available the moment the Prisma Client is generated (`npx prisma generate`, run automatically via `postinstall` and by `prisma db push`) — there is no per-model registration step or ordering dependency between files to worry about, unlike the original Mongoose design's `models/index.ts` side-effect-import convention.
+5. If the Telegram bot integration is enabled (`TELEGRAM_BOT_TOKEN` set), the bot instance itself is **also** lazily constructed — the first inbound webhook request (or the explicit `scripts/run-bot-polling.ts` script) triggers `getBot()`, which uses the same cached `prisma` client, sets up grammY session storage backed by the `TelegramBotSession` table via a small custom Prisma storage adapter (`lib/telegram/client.ts`'s `prismaStorageAdapter`), and registers command handlers exactly once per server process (`registered` flag guard in `lib/telegram/bot.ts`).
 6. The background order processor (`scripts/process-orders.ts`) is a **separate OS process**, started independently (not by the Next.js server) — see [`../README.md`](../README.md#11-production-setup--operational-requirements).
 
 ## 2. Request Lifecycle: Web (representative pattern, all API routes follow this shape)
@@ -22,7 +22,7 @@ This document traces concrete request/data lifecycles through the system, from a
 2. auth() — resolve session from the request's JWT cookie (skip for public routes)
 3. Authorization check — reject 401 if no session; reject 403 if role requirement not met
 4. Rate limit check (lib/rate-limit.ts) — reject 429 if the caller's bucket is exhausted
-5. connectDB() — ensure a live MongoDB connection (usually already cached)
+5. connectDB() — ensure the Prisma client is connected to Postgres (usually already cached)
 6. Parse & validate request body/query params with a Zod schema (lib/validation.ts)
 7. Call the relevant lib/services/* function — this is where business logic and
    any required transaction happens
@@ -115,7 +115,7 @@ See [`ARCHITECTURE.md` §8](ARCHITECTURE.md#8-error-handling-strategy) for the g
 
 1. A known business-rule violation raises `AppError(code, message)` from within a `lib/services/*` function.
 2. The calling route handler catches it specifically, maps `code` to an HTTP status via a local `errorStatusMap`, and returns `{ error: message }` — the bot instead sends `message` as a plain chat reply.
-3. Any other thrown error (a bug, a network failure talking to MongoDB, an unexpected exception) is caught by the route's outer try/catch, logged via `console.error` with context, and converted to a generic `{ error: "Internal server error" }` / `500` — no internal detail (stack trace, MongoDB error text) is ever returned to the client.
+3. Any other thrown error (a bug, a network failure talking to Postgres, an unexpected exception) is caught by the route's outer try/catch, logged via the structured logger with context, and converted to a generic `{ error: "Internal server error" }` / `500` — no internal detail (stack trace, Postgres error text) is ever returned to the client.
 4. Failures in **non-critical side effects** (Telegram notifications, audit log writes, email sending) are caught internally by those functions themselves and logged — they never bubble up to fail the primary operation that triggered them. A failed order-placement notification, for example, still leaves the customer with a successfully created, charged order; only the admin's alert is missing (and would need to be recovered by checking the dashboard).
 5. Failures during **order fulfillment dispatch** specifically are treated as retryable, not terminal — see [`ARCHITECTURE.md` §5](ARCHITECTURE.md#5-fulfillment-dispatch) and the background worker in §10 below.
 
@@ -135,13 +135,13 @@ loop (every 30s if run with --loop, otherwise a single pass):
   4. Sleep 30s (loop mode) or exit (single-pass mode)
 ```
 
-This is the **only** scheduled/background process in the system today — there is no separate job for, e.g., syncing provider balances, cleaning up old sessions, or archiving old records (`VerificationToken` cleanup is instead handled passively by MongoDB's TTL index, per [`DATABASE.md` §7](DATABASE.md#7-data-lifecycle-retention-and-ttl-indexes)).
+This is not the only scheduled/background process in the system — a separate job also handles `VerificationToken` cleanup (`scripts/cleanup-expired-tokens.ts`, `npm run cleanup-expired-tokens`, or `GET /api/cron/cleanup-expired-tokens`), since Postgres has no native TTL-index mechanism equivalent to MongoDB's (which the original design relied on to expire these rows passively, with no application code); see [`DATABASE.md` §7](DATABASE.md#7-data-lifecycle-retention-and-cleanup). There is still no separate job for, e.g., syncing provider balances or archiving old records beyond that.
 
 ## 11. External Integrations Summary
 
 | Integration | Used for | Failure behavior |
 |---|---|---|
-| MongoDB Atlas | All persistent state | App cannot function without it; `connectDB()` failures propagate as request-level 500s (or process-crash for scripts). `GET /api/health` surfaces connectivity as a 503. |
+| Supabase (PostgreSQL) | All persistent state | App cannot function without it; Prisma client failures propagate as request-level 500s (or process-crash for scripts). `GET /api/health` surfaces connectivity as a 503. |
 | Telegram Bot API | Bot commands/conversations, admin/customer notifications | Fully optional — every code path checks for `TELEGRAM_BOT_TOKEN` and no-ops if absent. Individual send failures are caught and logged, never thrown to the caller. |
 | SMTP provider (via Nodemailer) | Verification/reset emails | If unconfigured, emails are logged to console instead of sent (dev-friendly, **not acceptable in production** — see [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md)). |
 | Upstash Redis | Distributed rate limiting | If unconfigured, silently falls back to an in-memory limiter (logged as a warning when `NODE_ENV=production`), which does not coordinate across multiple server instances. |

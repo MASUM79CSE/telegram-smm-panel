@@ -20,6 +20,7 @@
     "process-orders": "tsx scripts/process-orders.ts",
     "poll-order-status": "tsx scripts/poll-order-status.ts",
     "compute-delivery-estimates": "tsx scripts/compute-delivery-estimates.ts",
+    "cleanup-expired-tokens": "tsx scripts/cleanup-expired-tokens.ts",
     "telegram:webhook": "tsx scripts/setup-telegram-webhook.ts",
     "telegram:poll": "tsx scripts/run-bot-polling.ts",
     "verify-restore": "tsx scripts/verify-restore.ts",

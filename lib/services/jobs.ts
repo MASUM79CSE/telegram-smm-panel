@@ -39,6 +39,13 @@ const POLL_STATUS_MIN_RECHECK_INTERVAL_MS = 2 * 60 * 1000;
 
 const DELIVERY_ESTIMATE_SAMPLE_SIZE = 50;
 
+// How long past `expiresAt` a VerificationToken row is kept before being
+// physically deleted. Not zero/immediate: a small grace window means a
+// token that just expired (e.g. a support inquiry about "my link didn't
+// work") can still be inspected (usedAt/expiresAt/purpose) for a few days
+// rather than being gone the moment this job's next run happens to land.
+const EXPIRED_TOKEN_RETENTION_DAYS = 7;
+
 // A PROCESSING order that hasn't moved to IN_PROGRESS/COMPLETED/FAILED
 // within this window is either stuck on a provider-side issue or on a bug
 // in dispatchOrderToProvider — either way, worth a human looking at it.
@@ -203,6 +210,44 @@ export async function runComputeDeliveryEstimatesJob(): Promise<JobRunResult> {
   }
 
   return { candidateCount: services.length, succeeded, failed };
+}
+
+/**
+ * Deletes expired `VerificationToken` rows (docs/DATABASE.md §7 / the
+ * Prisma schema's own comment on this model).
+ *
+ * MongoDB's version of this schema had a native TTL index on `expiresAt`
+ * (`expireAfterSeconds: 0`) — the database itself deleted expired
+ * documents in the background, with no application code involved.
+ * Postgres has no equivalent built-in mechanism, so this job exists to
+ * replace it: a periodic scheduled sweep (see `.github/workflows/cron.yml`
+ * and `GET /api/cron/cleanup-expired-tokens`) that physically deletes rows
+ * whose `expiresAt` is more than `EXPIRED_TOKEN_RETENTION_DAYS` in the
+ * past. Deliberately NOT deleted the instant they expire — see that
+ * constant's own comment.
+ *
+ * Safe to run at any frequency, including overlapping itself: this is a
+ * pure `deleteMany` on a `expiresAt < cutoff` condition, not a stateful
+ * operation, so a slow run overlapping the next scheduled one just
+ * results in the second run finding fewer (or zero) matching rows left
+ * to delete rather than any incorrect double-processing.
+ *
+ * Deleting an already-expired, already-consumed-or-unusable token has no
+ * effect on application behavior: every code path that reads a
+ * `VerificationToken` already checks `expiresAt`/`usedAt` before trusting
+ * it (see `lib/services/*` verification-token consumers), so this job is
+ * purely a storage-hygiene measure, not a correctness dependency.
+ */
+export async function runCleanupExpiredTokensJob(): Promise<JobRunResult> {
+  await connectDB();
+
+  const cutoff = new Date(Date.now() - EXPIRED_TOKEN_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+  const { count } = await prisma.verificationToken.deleteMany({
+    where: { expiresAt: { lt: cutoff } },
+  });
+
+  return { candidateCount: count, succeeded: count, failed: 0 };
 }
 
 /**

@@ -71,7 +71,7 @@ doesn't return 200. Until Sentry alerting is actually configured, treat
 these as your detection surfaces:
 
 - **`GET /api/health`** (`app/api/health/route.ts`) — liveness/readiness
-  probe; returns `503` when MongoDB is unreachable. Point an external
+  probe; returns `503` when Postgres/Supabase is unreachable. Point an external
   uptime monitor (even a free one) at this today — it costs nothing and
   closes the biggest gap (finding out the site is down from a user
   complaint instead of a monitor). Already checked automatically
@@ -85,7 +85,7 @@ these as your detection surfaces:
   `/admin/support`) and direct reports are, realistically, the primary
   detection method today. Take a cluster of similar reports in a short
   window seriously even before you've reproduced it yourself.
-- **`AuditLog` collection** (`models/AuditLog.ts`) — for "did an admin
+- **`AuditLog` table** (`prisma/schema.prisma`) — for "did an admin
   action cause this," check recent entries for the affected resource
   (e.g. `targetType: "Order"`, `targetId: <id>`) before assuming it's a
   code bug.
@@ -106,9 +106,7 @@ few minutes is *triage and stop the bleeding*, not necessarily a full fix.
    to bound "how far back do I need to check/restore."
 2. **Check `GET /api/health`.** Is the process up? Is the DB reachable?
    This alone separates "app bug" from "infra outage."
-3. **Check MongoDB Atlas status** (cluster metrics/alerts in the Atlas
-   console) — connection pool exhaustion, disk space, and CPU spikes show
-   up there before they show up as app errors.
+3. **Check Supabase project status** (Database → Reports / the project's health metrics in the Supabase Dashboard) — connection pool exhaustion (check active connections against the pooler's limit), disk space, and CPU spikes show up there before they show up as app errors.
 4. **Check recent deploys.** Did this start right after a deploy? If yes,
    the fastest mitigation for SEV-1 is usually **rollback**, not a forward
    fix under pressure — root-cause afterward with time pressure removed.
@@ -119,7 +117,7 @@ few minutes is *triage and stop the bleeding*, not necessarily a full fix.
    [§5 below](#5-money--wallet-incidents-treat-as-sev-1) before taking any
    corrective action — wallet/order writes are transactional
    (see [`DATABASE.md`](DATABASE.md#6-transactions) for exactly which
-   operations are wrapped in a Mongo session/transaction) and the safe
+   operations are wrapped in a `prisma.$transaction`) and the safe
    fix is almost always "credit/debit a compensating entry," never
    "directly edit a balance field."
 7. **Communicate status** — even a one-line "investigating a SEV-1, orders
@@ -140,8 +138,8 @@ deserve extra care:
 
 - **Never hand-edit a wallet balance directly in the database.** Every
   legitimate balance change already goes through a service function that
-  writes a corresponding ledger-style record and uses a Mongo transaction
-  (`lib/services/payments.ts`, `lib/services/admin-payments.ts`,
+  writes a corresponding ledger-style record and uses a Postgres transaction
+  (`prisma.$transaction`; `lib/services/payments.ts`, `lib/services/admin-payments.ts`,
   `lib/services/refunds.ts`, `lib/services/orders.ts` — see
   [`DATABASE.md` §6](DATABASE.md#6-transactions)).
   If a balance is wrong, the fix is to run/replay the correct service
@@ -163,7 +161,7 @@ deserve extra care:
   genuinely awaiting admin approval — check the admin deposits queue
   first, this is not a bug — or (b) the approval action itself is
   erroring; check logs around `approveDeposit`'s atomic claim
-  (`updateOne({_id, status: "PENDING"}, ...)`), which fails closed with
+  (`updateMany({ where: { id, status: "PENDING" }, ... })`), which fails closed with
   `ALREADY_PROCESSED` if the payment was already actioned by someone else.
 - **Duplicate-credit reports**: `submitDeposit` rejects a resubmitted
   `transactionRef` outright (unique index + explicit existence check,
@@ -187,8 +185,7 @@ deserve extra care:
    build/runtime logs for crash loops. If `.github/workflows/post-deploy-
    smoke-test.yml` failed on the most recent deploy, that's your fastest
    signal — check the Actions tab before digging elsewhere.
-3. Check MongoDB Atlas for an outage/maintenance window or IP-allowlist
-   change (a common self-inflicted cause: a new deploy IP not allowlisted).
+3. Check the Supabase project's status/health metrics for an outage or maintenance window, and confirm `DATABASE_URL`/`DIRECT_URL` still resolve (a common self-inflicted cause: a rotated Supabase database password, or `DATABASE_URL` accidentally pointing at the non-pooled direct connection string under serverless traffic — see [`DATABASE.md` §10](DATABASE.md#10-performance--scalability-notes)).
 4. **If caused by a recent deploy, roll back immediately.** If the
    `AUTO_ROLLBACK_ENABLED` repository variable is turned on (see
    [`PRODUCTION_READINESS.md` §14](PRODUCTION_READINESS.md#14-cicd-pipeline-readiness)),
@@ -273,32 +270,33 @@ Remember deposits here are manual-approval, not an automated webhook (see
 There is **no backup automation in this codebase** — see
 [`DATABASE.md` §9](DATABASE.md#9-backup--recovery) and
 [`PRODUCTION_READINESS.md` §13](PRODUCTION_READINESS.md#13-database-backup--recovery--disaster-recovery).
-Restore relies entirely on whatever the production MongoDB Atlas project
-tier provides:
+Restore relies entirely on whatever the production Supabase project's
+plan provides:
 
-1. **Before touching anything destructive**, confirm your Atlas project
-   tier actually has backups enabled (paid tiers only — the free M0 tier
-   does not have production-grade backup/PITR). If you don't know, check
-   the Atlas console's **Backup** tab for the cluster *before* you need it,
+1. **Before touching anything destructive**, confirm your Supabase project
+   is actually on a plan with backups enabled (Pro and above — the free
+   plan has no dashboard-managed backups at all). If you don't know, check
+   the Dashboard's **Database → Backups** page *before* you need it,
    not during an incident.
-2. **Restoring**: Atlas Cloud Backup restores are performed from the Atlas
-   console (Backup → select a snapshot/point-in-time → Restore), either
-   in-place or to a new cluster. Prefer restoring to a **new cluster** and
-   verifying data there before cutting the app over — restoring in-place
-   over a live cluster is not reversible.
+2. **Restoring**: from the Dashboard, **Database → Backups** → select a
+   daily backup (or, with the Point-in-Time Recovery add-on enabled, the
+   **Point in Time** tab's date/time picker) → **Restore to a New Project**.
+   Prefer restoring to a **new project** and verifying data there before
+   cutting the app over — an in-place restore makes the live project itself
+   inaccessible for the duration and is not reversible.
 3. **After any restore**, re-run this project's health check
    (`GET /api/health`) and run
-   `npm run verify-restore -- --live "<LIVE_MONGODB_URI>" --restored "<RESTORED_MONGODB_URI>"`
+   `npm run verify-restore -- --live "<LIVE_DATABASE_URL>" --restored "<RESTORED_DATABASE_URL>"`
    (`scripts/verify-restore.ts`) before declaring the incident resolved —
-   it replaces an ad-hoc manual spot-check with a concrete per-collection
-   count comparison, a `Wallet.balance` grand-total consistency check
+   it replaces an ad-hoc manual spot-check with a concrete per-table
+   row-count comparison, a `Wallet.balance` grand-total consistency check
    (flags a restored total that's impossible under a genuine point-in-time
    restore), and a report of exactly how many minutes of `Order`/`Payment`
    history the restore lost relative to the live database. A restore can
    succeed technically while still landing on a snapshot that predates the
    last known-good state, silently losing recent writes — this script is
    meant to catch that instead of a hopeful eyeball check.
-4. **`verify-restore.ts` itself has been verified twice** — mechanically against local test databases, and for real against this project's actual production Atlas cluster's live data (confirmed correct document counts, a matching real `Wallet.balance` Decimal128 total, and a correctly-reported 0-minute data-loss window when compared against itself as the closest available proxy without Atlas restore-creation access). **What has NOT been tested end-to-end is the actual Atlas Cloud Backup restore-to-a-new-cluster step** — see the standing gap in `PRODUCTION_READINESS.md` §13. Do a real dry-run restore against a throwaway cluster via the Atlas console, then run `verify-restore.ts` against its output, before relying on this in a real incident — an untested backup is not a backup.
+4. **`verify-restore.ts` itself has been verified twice** — mechanically against local test databases, and for real against this project's actual production Supabase database's live data (confirmed correct row counts, a matching real `Wallet.balance` Postgres `Decimal` total, and a correctly-reported 0-minute data-loss window when compared against itself as the closest available proxy without Supabase restore-creation access). **What has NOT been tested end-to-end is the actual Supabase Dashboard restore-to-a-new-project step**, which requires a paid Supabase plan — see the standing gap in `PRODUCTION_READINESS.md` §13. Do a real dry-run restore via the Supabase Dashboard, then run `verify-restore.ts` against its output, before relying on this in a real incident — an untested backup is not a backup.
 
 ---
 

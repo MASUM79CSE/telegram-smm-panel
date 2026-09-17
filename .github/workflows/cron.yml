@@ -3,10 +3,11 @@ name: Cron (production background jobs)
 # Invokes this project's serverless background-job endpoints on a schedule
 # (docs/PRODUCTION_READINESS.md §14). These exist because the chosen
 # deployment target — Vercel — cannot run `scripts/process-orders.ts` /
-# `poll-order-status.ts` / `compute-delivery-estimates.ts` as long-lived
-# processes at all (serverless functions don't persist between requests;
-# see `lib/services/jobs.ts` for the extracted shared logic those scripts
-# and these HTTP endpoints both call).
+# `poll-order-status.ts` / `compute-delivery-estimates.ts` /
+# `cleanup-expired-tokens.ts` as long-lived processes at all (serverless
+# functions don't persist between requests; see `lib/services/jobs.ts` for
+# the extracted shared logic those scripts and these HTTP endpoints both
+# call).
 #
 # Why GitHub Actions instead of Vercel's own native Cron Jobs: Vercel Cron
 # only supports once-per-day schedules (imprecise, within-the-hour) on the
@@ -45,12 +46,25 @@ on:
     # Recompute per-service delivery estimates — cheap, low-urgency, hourly
     # is plenty (matches the original script's own --loop cadence).
     - cron: "7 * * * *"
+    # Delete expired VerificationToken rows — replaces MongoDB's native TTL
+    # index (see lib/services/jobs.ts#runCleanupExpiredTokensJob's own doc
+    # comment), the least time-sensitive job by far, so once daily is
+    # plenty. Offset to an off-peak hour/minute, well clear of the other
+    # three jobs' schedules above.
+    - cron: "13 3 * * *"
   workflow_dispatch:
     inputs:
       job:
         description: "Which job to run (leave as 'all' for a manual full pass)"
         type: choice
-        options: ["all", "process-orders", "poll-order-status", "compute-delivery-estimates"]
+        options:
+          [
+            "all",
+            "process-orders",
+            "poll-order-status",
+            "compute-delivery-estimates",
+            "cleanup-expired-tokens",
+          ]
         default: "all"
 
 jobs:
@@ -102,5 +116,22 @@ jobs:
           echo ""
           if [ "$status" -ge 300 ]; then
             echo "::error::compute-delivery-estimates returned HTTP $status"
+            exit 1
+          fi
+
+  cleanup-expired-tokens:
+    name: Clean up expired verification tokens
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'all' || github.event.inputs.job == 'cleanup-expired-tokens') || (github.event_name == 'schedule' && github.event.schedule == '13 3 * * *')
+    steps:
+      - name: Call /api/cron/cleanup-expired-tokens
+        run: |
+          status=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.PROD_URL }}/api/cron/cleanup-expired-tokens")
+          cat /tmp/body.json
+          echo ""
+          if [ "$status" -ge 300 ]; then
+            echo "::error::cleanup-expired-tokens returned HTTP $status"
             exit 1
           fi

@@ -472,6 +472,7 @@ describe("Route-handler auth boundary — intentionally public / differently-aut
     "@/app/api/cron/process-orders/route",
     "@/app/api/cron/poll-order-status/route",
     "@/app/api/cron/compute-delivery-estimates/route",
+    "@/app/api/cron/cleanup-expired-tokens/route",
   ])(
     "GET %s never calls the session-based auth() (uses CRON_SECRET shared-secret auth instead)",
     async (modulePath) => {
@@ -507,6 +508,7 @@ describe("Route-handler auth boundary — intentionally public / differently-aut
       ["/api/cron/process-orders", "@/app/api/cron/process-orders/route"],
       ["/api/cron/poll-order-status", "@/app/api/cron/poll-order-status/route"],
       ["/api/cron/compute-delivery-estimates", "@/app/api/cron/compute-delivery-estimates/route"],
+      ["/api/cron/cleanup-expired-tokens", "@/app/api/cron/cleanup-expired-tokens/route"],
     ])("GET %s rejects a request with no CRON_SECRET header", async (path, modulePath) => {
       delete process.env.CRON_SECRET;
       vi.resetModules();

@@ -10,7 +10,7 @@ updates:
       # Batch low-risk patch/minor updates into a single PR per week
       # instead of one PR per package, so review load stays manageable;
       # major version bumps (which can be breaking, e.g. Next.js/React/
-      # Mongoose/NextAuth major releases) are deliberately NOT grouped —
+      # Prisma/NextAuth major releases) are deliberately NOT grouped —
       # each gets its own PR requiring individual review.
       minor-and-patch:
         update-types: ["minor", "patch"]
