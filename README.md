@@ -290,7 +290,6 @@ More scenarios, plus the formal incident-response runbook (severity levels, scen
 | [`docs/I18N_PLAN.md`](docs/I18N_PLAN.md) | Internationalization architecture and the live currency-display conversion layer |
 | [`docs/COMPETITIVE_ANALYSIS_AND_ROADMAP.md`](docs/COMPETITIVE_ANALYSIS_AND_ROADMAP.md) | Competitive teardown and prioritized roadmap |
 | [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | Execution-ready task breakdown for the roadmap above |
-| [`MEMORY.md`](MEMORY.md) | Project history, key decisions, conventions — primary reference for contributors |
 
 ## 📄 License
 

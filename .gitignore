@@ -69,3 +69,7 @@ next-env.d.ts
 /test-results/
 /playwright-report/
 /playwright/.cache/
+
+# Internal working notes — never meant for the public repo (see README.md's
+# own note on this)
+MEMORY.md
