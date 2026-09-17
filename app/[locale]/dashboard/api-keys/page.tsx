@@ -1,21 +1,20 @@
 import { getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ApiKey } from "@/models/ApiKey";
+import { prisma } from "@/lib/db";
 import { ApiKeysPanel } from "@/components/dashboard/api-keys-panel";
 
 export default async function ApiKeysPage() {
   const session = await auth();
-  await connectDB();
   const t = await getTranslations("Dashboard.apiKeys");
 
-  const keys = await ApiKey.find({ userId: session!.user.id })
-    .select("-keyHash")
-    .sort({ createdAt: -1 })
-    .lean();
+  const keys = await prisma.apiKey.findMany({
+    where: { userId: session!.user.id },
+    omit: { keyHash: true },
+    orderBy: { createdAt: "desc" },
+  });
 
   const serialized = keys.map((k) => ({
-    _id: k._id.toString(),
+    _id: k.id,
     label: k.label,
     keyPrefix: k.keyPrefix,
     lastUsedAt: k.lastUsedAt ? k.lastUsedAt.toISOString() : null,

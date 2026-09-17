@@ -1,18 +1,16 @@
-import { connectDB } from "@/lib/db";
-import { Provider } from "@/models/Provider";
+import { prisma } from "@/lib/db";
 import { ProvidersManager } from "@/components/admin/providers-manager";
 import { ProviderHealthPanel } from "@/components/admin/provider-health-panel";
 import { getProviderHealthSummary } from "@/lib/services/analytics";
 
 export default async function AdminProvidersPage() {
-  await connectDB();
   const [providers, health] = await Promise.all([
-    Provider.find().sort({ createdAt: -1 }).lean(),
+    prisma.provider.findMany({ orderBy: { createdAt: "desc" }, omit: { apiKeyEncrypted: true } }),
     getProviderHealthSummary(),
   ]);
 
   const rows = providers.map((p) => ({
-    _id: p._id.toString(),
+    _id: p.id,
     name: p.name,
     type: p.type,
     status: p.status,

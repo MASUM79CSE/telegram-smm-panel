@@ -1,4 +1,5 @@
-import { Order, type OrderStatus } from "@/models/Order";
+import { prisma } from "@/lib/db";
+import type { OrderStatus, Prisma } from "@/lib/generated/prisma";
 import { AppError } from "@/lib/errors";
 
 /**
@@ -7,12 +8,12 @@ import { AppError } from "@/lib/errors";
  * Scope note — deliberately narrow: bulk operations on Payments (approve)
  * and Users (status/role change) do NOT get a new service function here.
  * They compose the existing single-item, individually-tested code paths
- * (`approveDeposit()` in lib/services/admin-payments.ts,
- * `User.findByIdAndUpdate` in app/api/admin/users/[id]/route.ts) via a
- * client-side loop of calls to their existing routes — see
- * components/admin/{payments,users}-table.tsx. That preserves each row's
- * existing atomic-transaction/self-modification-guard invariants exactly
- * as-is, with zero new money-movement or auth code to review.
+ * (`approveDeposit()` in lib/services/admin-payments.ts, the admin users
+ * route's own update logic) via a client-side loop of calls to their
+ * existing routes — see components/admin/{payments,users}-table.tsx. That
+ * preserves each row's existing atomic-transaction/self-modification-guard
+ * invariants exactly as-is, with zero new money-movement or auth code to
+ * review.
  *
  * Bulk order-status change is the one genuinely new server-side operation
  * in this feature, because no single-call bulk endpoint for order status
@@ -40,11 +41,11 @@ export interface BulkOrderStatusResult {
 
 /**
  * Transition a batch of orders to a bulk-safe status. Each order is
- * updated independently (not a single multi-document transaction) — a
- * plain status/history update carries no cross-document invariant that
- * requires atomicity across rows (unlike a wallet credit), so a partial
- * failure (e.g. one bad id) reports per-row instead of rolling back the
- * whole batch, which is more useful for an admin working through a list.
+ * updated independently (not a single multi-row transaction) — a plain
+ * status/history update carries no cross-row invariant that requires
+ * atomicity across rows (unlike a wallet credit), so a partial failure
+ * (e.g. one bad id) reports per-row instead of rolling back the whole
+ * batch, which is more useful for an admin working through a list.
  */
 export async function bulkChangeOrderStatus(
   orderIds: string[],
@@ -74,25 +75,29 @@ export async function bulkChangeOrderStatus(
   // succeeded/failed outcome even if others reject.
   // A dedicated marker class distinguishes the one EXPECTED per-row
   // failure (id doesn't exist — a normal, safe-to-report outcome) from any
-  // OTHER rejection (e.g. a malformed id producing a raw Mongoose
-  // `CastError`, whose message embeds internal schema/model details and
-  // must not be echoed back to an API client — see the catch branch
-  // below).
+  // OTHER rejection (e.g. a malformed id producing a raw Prisma
+  // `PrismaClientKnownRequestError`, whose message embeds internal
+  // schema/model details and must not be echoed back to an API client —
+  // see the catch branch below).
   class OrderNotFoundError extends Error {}
 
   const outcomes = await Promise.allSettled(
     orderIds.map(async (orderId) => {
-      const order = await Order.findByIdAndUpdate(
-        orderId,
-        {
-          status,
-          $push: { statusHistory: { status, note: note ?? null, at: now } },
-        },
-        { returnDocument: "after" }
-      );
-      if (!order) {
+      const existing = await prisma.order.findUnique({ where: { id: orderId } });
+      if (!existing) {
         throw new OrderNotFoundError("Order not found.");
       }
+
+      const existingHistory = Array.isArray(existing.statusHistory) ? existing.statusHistory : [];
+      const statusHistory = [
+        ...existingHistory,
+        { status, note: note ?? null, at: now.toISOString() },
+      ] as Prisma.InputJsonValue;
+
+      await prisma.order.update({
+        where: { id: orderId },
+        data: { status: status as OrderStatus, statusHistory },
+      });
       return orderId;
     })
   );

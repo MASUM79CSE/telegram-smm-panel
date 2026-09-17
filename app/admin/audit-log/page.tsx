@@ -1,19 +1,16 @@
-import { connectDB } from "@/lib/db";
-import { AuditLog } from "@/models/AuditLog";
+import { prisma } from "@/lib/db";
 import { AuditLogViewer } from "@/components/admin/audit-log-viewer";
 
 const LIMIT = 30;
 
 export default async function AdminAuditLogPage() {
-  await connectDB();
-
   const [entries, total] = await Promise.all([
-    AuditLog.find().sort({ createdAt: -1 }).limit(LIMIT).lean(),
-    AuditLog.countDocuments(),
+    prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: LIMIT }),
+    prisma.auditLog.count(),
   ]);
 
   const rows = entries.map((e) => ({
-    _id: e._id.toString(),
+    _id: e.id,
     actorEmail: e.actorEmail,
     action: e.action,
     targetType: e.targetType,

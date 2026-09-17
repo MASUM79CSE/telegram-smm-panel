@@ -1,7 +1,6 @@
 import type { MetadataRoute } from "next";
 import { env } from "@/lib/env";
-import { connectDB } from "@/lib/db";
-import { Category } from "@/models/Category";
+import { prisma } from "@/lib/db";
 import { logger } from "@/lib/logger";
 
 /**
@@ -48,8 +47,10 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   ];
 
   try {
-    await connectDB();
-    const categories = await Category.find({ active: true }).select("slug updatedAt").lean();
+    const categories = await prisma.category.findMany({
+      where: { active: true },
+      select: { slug: true, updatedAt: true },
+    });
 
     const categoryEntries: MetadataRoute.Sitemap = categories.map((c) => ({
       url: `${baseUrl}/services#${c.slug}`,

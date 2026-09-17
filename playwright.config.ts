@@ -20,9 +20,10 @@ import { TEST_PORT } from "./e2e/global-setup";
  * plugin-setup tasks, which run BEFORE `globalSetup`, so env vars this
  * suite computes at runtime (`MONGODB_URI` from an async in-memory Mongo
  * replica set, the dynamic `E2E_SERVER_LOG_PATH`, etc.) would not exist
- * yet when a Playwright-managed `webServer` process is spawned. Confirmed
- * by direct inspection of the installed Playwright runner and a minimal
- * repro, not assumption.
+ * yet when a Playwright-managed `webServer` process is spawned (env vars
+ * this suite computes at runtime — `DATABASE_URL`/`DIRECT_URL`, the
+ * dynamic `E2E_SERVER_LOG_PATH`, etc.). Confirmed by direct inspection of
+ * the installed Playwright runner and a minimal repro, not assumption.
  *
  * Deliberately single-browser (Chromium only, not the full
  * Chromium+Firefox+WebKit matrix Playwright defaults encourage) — this is

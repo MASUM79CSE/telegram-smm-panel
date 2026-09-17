@@ -1,9 +1,9 @@
-import { AuditLog, AuditAction } from "@/models/AuditLog";
-import { Types } from "mongoose";
+import { prisma } from "@/lib/db";
+import type { AuditAction, Prisma } from "@/lib/generated/prisma";
 import { logger, requestLogger } from "@/lib/logger";
 
 interface AuditParams {
-  actorId?: string | Types.ObjectId | null;
+  actorId?: string | null;
   actorEmail?: string | null;
   action: AuditAction;
   targetType?: string;
@@ -17,15 +17,17 @@ export async function recordAudit(params: AuditParams): Promise<void> {
     const ip = params.request?.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
     const userAgent = params.request?.headers.get("user-agent") ?? null;
 
-    await AuditLog.create({
-      actorId: params.actorId ?? null,
-      actorEmail: params.actorEmail ?? null,
-      action: params.action,
-      targetType: params.targetType ?? null,
-      targetId: params.targetId ?? null,
-      metadata: params.metadata ?? null,
-      ip,
-      userAgent,
+    await prisma.auditLog.create({
+      data: {
+        actorId: params.actorId ?? null,
+        actorEmail: params.actorEmail ?? null,
+        action: params.action,
+        targetType: params.targetType ?? null,
+        targetId: params.targetId ?? null,
+        metadata: (params.metadata ?? null) as Prisma.InputJsonValue,
+        ip,
+        userAgent,
+      },
     });
   } catch (err) {
     // Audit logging must never break the primary operation, but we must not

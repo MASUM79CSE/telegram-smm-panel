@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ApiKey } from "@/models/ApiKey";
+import { prisma } from "@/lib/db";
 import { apiKeyCreateSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { createApiKey } from "@/lib/services/api-keys";
@@ -16,12 +15,11 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await connectDB();
-
-  const keys = await ApiKey.find({ userId: session.user.id })
-    .select("-keyHash")
-    .sort({ createdAt: -1 })
-    .lean();
+  const keys = await prisma.apiKey.findMany({
+    where: { userId: session.user.id },
+    omit: { keyHash: true },
+    orderBy: { createdAt: "desc" },
+  });
 
   return NextResponse.json({ keys });
 }
@@ -37,8 +35,6 @@ export async function POST(request: Request) {
   if (!success) {
     return NextResponse.json({ error: "Too many key creation attempts. Please try again later." }, { status: 429 });
   }
-
-  await connectDB();
 
   const body = await request.json().catch(() => ({}));
   const parsed = apiKeyCreateSchema.safeParse(body);
@@ -56,7 +52,7 @@ export async function POST(request: Request) {
     actorEmail: session.user.email,
     action: "API_KEY_CREATED",
     targetType: "ApiKey",
-    targetId: apiKey._id.toString(),
+    targetId: apiKey.id,
     request,
   });
 
@@ -67,7 +63,7 @@ export async function POST(request: Request) {
     {
       message: "API key created. Copy it now — it will not be shown again.",
       key: rawKey,
-      apiKey: { _id: apiKey._id, label: apiKey.label, keyPrefix: apiKey.keyPrefix, createdAt: apiKey.createdAt },
+      apiKey: { _id: apiKey.id, label: apiKey.label, keyPrefix: apiKey.keyPrefix, createdAt: apiKey.createdAt },
     },
     { status: 201 }
   );

@@ -1,26 +1,23 @@
 import Link from "next/link";
-import { connectDB } from "@/lib/db";
-import { Category } from "@/models/Category";
-import { ServiceGroup } from "@/models/ServiceGroup";
+import { prisma } from "@/lib/db";
 import { CategoriesManager } from "@/components/admin/categories-manager";
 
 export default async function AdminCategoriesPage() {
-  await connectDB();
   const [categories, groups] = await Promise.all([
-    Category.find().sort({ sortOrder: 1, name: 1 }).lean(),
-    ServiceGroup.find({ active: true }).sort({ sortOrder: 1, name: 1 }).lean(),
+    prisma.category.findMany({ orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }),
+    prisma.serviceGroup.findMany({ where: { active: true }, orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }),
   ]);
 
   const rows = categories.map((c) => ({
-    _id: c._id.toString(),
+    _id: c.id,
     name: c.name,
     description: c.description,
-    groupId: c.groupId ? c.groupId.toString() : null,
+    groupId: c.groupId ?? null,
     active: c.active,
   }));
 
   const groupOptions = groups.map((g) => ({
-    _id: g._id.toString(),
+    _id: g.id,
     name: g.icon ? `${g.icon} ${g.name}` : g.name,
   }));
 

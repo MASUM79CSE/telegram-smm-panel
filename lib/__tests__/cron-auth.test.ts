@@ -33,7 +33,8 @@ describe("lib/security/cron-auth — verifyCronSecret", () => {
     process.env = { ...ORIGINAL_ENV };
     // Required fields lib/env.ts's Zod schema needs regardless of this
     // test's concern, so getEnv() doesn't throw for unrelated reasons.
-    process.env.MONGODB_URI ||= "mongodb://localhost:27017/test";
+    process.env.DATABASE_URL ||= "postgresql://user:pass@localhost:5432/test?schema=public";
+    process.env.DIRECT_URL ||= "postgresql://user:pass@localhost:5432/test?schema=public";
     process.env.AUTH_SECRET ||= "a".repeat(32);
   });
 

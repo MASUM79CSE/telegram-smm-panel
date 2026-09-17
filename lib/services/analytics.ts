@@ -1,20 +1,23 @@
-import { Types } from "mongoose";
-import { Order } from "@/models/Order";
-import { Transaction } from "@/models/Transaction";
-import { User } from "@/models/User";
-import { Service } from "@/models/Service";
-import { Provider } from "@/models/Provider";
+import { prisma } from "@/lib/db";
 import { decimalToNumber } from "@/lib/money";
 
 /**
- * Small, purpose-built Mongo aggregation helpers for the admin/customer
+ * Small, purpose-built Postgres aggregation helpers for the admin/customer
  * dashboard analytics views (docs/DASHBOARD_UPGRADE_PLAN.md §1.2).
  * Deliberately NOT a generic reporting engine — each function here backs
  * exactly one dashboard widget. All money values are converted to plain
- * `number` via `decimalToNumber()` before being returned, since chart data
- * only needs display-safe arithmetic, never currency-safe ledger math (the
- * actual ledger writes always go through `lib/money.ts`'s Decimal128
- * helpers elsewhere — nothing here mutates any data).
+ * `number` before being returned, since chart data only needs
+ * display-safe arithmetic, never currency-safe ledger math (the actual
+ * ledger writes always go through `lib/money.ts`'s Decimal helpers
+ * elsewhere — nothing here mutates any data).
+ *
+ * This is the Postgres/Prisma-era rewrite of the original MongoDB
+ * aggregation-pipeline version of this file. Prisma's `groupBy` cannot
+ * group by a *transformed* column (e.g. "day truncated from a timestamp"),
+ * so the day-bucketed queries here use `prisma.$queryRaw` with Postgres's
+ * native `date_trunc`/`to_char` instead — still fully parameterized via
+ * `Prisma.sql`/tagged templates, so there is no raw string interpolation
+ * of caller-controlled values anywhere in this file.
  */
 
 export interface DaySeriesPoint {
@@ -30,8 +33,8 @@ function daysAgo(days: number): Date {
 }
 
 /** Fills in zero-value days so charts don't show gaps for days with no activity. */
-function fillSeries(days: number, points: { _id: string; value: number }[]): DaySeriesPoint[] {
-  const map = new Map(points.map((p) => [p._id, p.value]));
+function fillSeries(days: number, points: { day: string; value: number }[]): DaySeriesPoint[] {
+  const map = new Map(points.map((p) => [p.day, p.value]));
   const result: DaySeriesPoint[] = [];
   const start = daysAgo(days);
   for (let i = 0; i < days; i++) {
@@ -41,6 +44,11 @@ function fillSeries(days: number, points: { _id: string; value: number }[]): Day
     result.push({ date: key, value: map.get(key) ?? 0 });
   }
   return result;
+}
+
+interface DayValueRow {
+  day: string;
+  value: number | string | null;
 }
 
 export interface RevenueSeries {
@@ -57,42 +65,37 @@ export async function getRevenueSeries(days: number): Promise<RevenueSeries> {
   const since = daysAgo(days);
   const previousSince = daysAgo(days * 2);
 
-  const [revenueAgg, orderAgg, previousRevenueAgg] = await Promise.all([
-    Transaction.aggregate<{ _id: string; value: number }>([
-      { $match: { type: "ORDER_PAYMENT", status: "COMPLETED", createdAt: { $gte: since } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          value: { $sum: { $toDouble: "$amount" } },
-        },
-      },
-    ]),
-    Order.aggregate<{ _id: string; value: number }>([
-      { $match: { createdAt: { $gte: since } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          value: { $sum: 1 },
-        },
-      },
-    ]),
-    Transaction.aggregate<{ total: number }>([
-      {
-        $match: {
-          type: "ORDER_PAYMENT",
-          status: "COMPLETED",
-          createdAt: { $gte: previousSince, $lt: since },
-        },
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: "$amount" } } } },
-    ]),
+  const [revenueRows, orderRows, previousRevenueRows] = await Promise.all([
+    prisma.$queryRaw<DayValueRow[]>`
+      SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, SUM(amount)::float AS value
+      FROM "Transaction"
+      WHERE type = 'ORDER_PAYMENT' AND status = 'COMPLETED' AND "createdAt" >= ${since}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw<DayValueRow[]>`
+      SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, COUNT(*)::int AS value
+      FROM "Order"
+      WHERE "createdAt" >= ${since}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw<{ total: number | string | null }[]>`
+      SELECT SUM(amount)::float AS total
+      FROM "Transaction"
+      WHERE type = 'ORDER_PAYMENT' AND status = 'COMPLETED' AND "createdAt" >= ${previousSince} AND "createdAt" < ${since}
+    `,
   ]);
 
-  const revenue = fillSeries(days, revenueAgg);
-  const orderCount = fillSeries(days, orderAgg);
+  const revenue = fillSeries(
+    days,
+    revenueRows.map((r) => ({ day: r.day, value: Number(r.value ?? 0) }))
+  );
+  const orderCount = fillSeries(
+    days,
+    orderRows.map((r) => ({ day: r.day, value: Number(r.value ?? 0) }))
+  );
   const totalRevenue = revenue.reduce((sum, p) => sum + p.value, 0);
   const totalOrders = orderCount.reduce((sum, p) => sum + p.value, 0);
-  const previousTotal = previousRevenueAgg[0]?.total ?? 0;
+  const previousTotal = Number(previousRevenueRows[0]?.total ?? 0);
   const revenueChangePct = previousTotal > 0 ? ((totalRevenue - previousTotal) / previousTotal) * 100 : null;
 
   return { revenue, orderCount, totalRevenue, totalOrders, revenueChangePct };
@@ -107,17 +110,17 @@ export interface UserGrowthSeries {
 export async function getUserGrowthSeries(days: number): Promise<UserGrowthSeries> {
   const since = daysAgo(days);
 
-  const agg = await User.aggregate<{ _id: string; value: number }>([
-    { $match: { createdAt: { $gte: since } } },
-    {
-      $group: {
-        _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-        value: { $sum: 1 },
-      },
-    },
-  ]);
+  const rows = await prisma.$queryRaw<DayValueRow[]>`
+    SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, COUNT(*)::int AS value
+    FROM "User"
+    WHERE "createdAt" >= ${since}
+    GROUP BY 1
+  `;
 
-  const signups = fillSeries(days, agg);
+  const signups = fillSeries(
+    days,
+    rows.map((r) => ({ day: r.day, value: Number(r.value ?? 0) }))
+  );
   return { signups, totalSignups: signups.reduce((sum, p) => sum + p.value, 0) };
 }
 
@@ -128,11 +131,14 @@ export interface OrderStatusCount {
 
 /** Count of orders per status, all-time — feeds a donut/bar breakdown chart. */
 export async function getOrderStatusBreakdown(): Promise<OrderStatusCount[]> {
-  const agg = await Order.aggregate<{ _id: string; count: number }>([
-    { $group: { _id: "$status", count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
-  ]);
-  return agg.map((a) => ({ status: a._id, count: a.count }));
+  const agg = await prisma.order.groupBy({
+    by: ["status"],
+    _count: { _all: true },
+    orderBy: { _count: { status: "desc" } },
+  });
+  return agg
+    .map((a) => ({ status: a.status, count: a._count._all }))
+    .sort((a, b) => b.count - a.count);
 }
 
 export interface TopService {
@@ -146,34 +152,26 @@ export interface TopService {
 export async function getTopServices(limit = 5, days = 30): Promise<TopService[]> {
   const since = daysAgo(days);
 
-  const agg = await Order.aggregate<{ _id: Types.ObjectId; orderCount: number; revenue: number; name: string }>([
-    { $match: { createdAt: { $gte: since } } },
-    {
-      $group: {
-        _id: "$serviceId",
-        orderCount: { $sum: 1 },
-        revenue: { $sum: { $toDouble: "$charge" } },
-      },
-    },
-    { $sort: { orderCount: -1 } },
-    { $limit: limit },
-    {
-      $lookup: {
-        from: Service.collection.name,
-        localField: "_id",
-        foreignField: "_id",
-        as: "service",
-      },
-    },
-    { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
-    { $addFields: { name: { $ifNull: ["$service.name", "(deleted service)"] } } },
-  ]);
+  const rows = await prisma.$queryRaw<
+    { serviceId: string; orderCount: number; revenue: number; name: string | null }[]
+  >`
+    SELECT o."serviceId" AS "serviceId",
+           COUNT(*)::int AS "orderCount",
+           SUM(o.charge)::float AS revenue,
+           COALESCE(s.name, '(deleted service)') AS name
+    FROM "Order" o
+    LEFT JOIN "Service" s ON s.id = o."serviceId"
+    WHERE o."createdAt" >= ${since}
+    GROUP BY o."serviceId", s.name
+    ORDER BY "orderCount" DESC
+    LIMIT ${limit}
+  `;
 
-  return agg.map((a) => ({
-    serviceId: a._id.toString(),
-    name: a.name,
-    orderCount: a.orderCount,
-    revenue: a.revenue,
+  return rows.map((r) => ({
+    serviceId: r.serviceId,
+    name: r.name ?? "(deleted service)",
+    orderCount: r.orderCount,
+    revenue: Number(r.revenue ?? 0),
   }));
 }
 
@@ -192,22 +190,23 @@ export interface ProviderHealth {
 
 /** Per-provider health snapshot for the admin providers page (read-only, no new sync mechanism). */
 export async function getProviderHealthSummary(): Promise<ProviderHealth[]> {
-  const providers = await Provider.find().lean();
+  const providers = await prisma.provider.findMany();
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const staleThreshold = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const results = await Promise.all(
     providers.map(async (p) => {
       const [ordersLast24h, lastErrorOrder] = await Promise.all([
-        Order.countDocuments({ providerId: p._id, createdAt: { $gte: since24h } }),
-        Order.findOne({ providerId: p._id, lastError: { $ne: null } })
-          .sort({ lastAttemptAt: -1 })
-          .select("lastError lastAttemptAt")
-          .lean(),
+        prisma.order.count({ where: { providerId: p.id, createdAt: { gte: since24h } } }),
+        prisma.order.findFirst({
+          where: { providerId: p.id, lastError: { not: null } },
+          orderBy: { lastAttemptAt: "desc" },
+          select: { lastError: true, lastAttemptAt: true },
+        }),
       ]);
 
       return {
-        providerId: p._id.toString(),
+        providerId: p.id,
         name: p.name,
         type: p.type,
         status: p.status,
@@ -257,43 +256,35 @@ export async function getFinancialReportRows(from: Date, to: Date): Promise<Fina
   const endOfTo = new Date(to);
   endOfTo.setUTCHours(23, 59, 59, 999);
 
-  const [revenueAgg, orderAgg, refundAgg, depositAgg] = await Promise.all([
-    Transaction.aggregate<{ _id: string; value: number }>([
-      { $match: { type: "ORDER_PAYMENT", status: "COMPLETED", createdAt: { $gte: from, $lte: endOfTo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          value: { $sum: { $toDouble: "$amount" } },
-        },
-      },
-    ]),
-    Order.aggregate<{ _id: string; value: number }>([
-      { $match: { createdAt: { $gte: from, $lte: endOfTo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          value: { $sum: 1 },
-        },
-      },
-    ]),
-    Transaction.aggregate<{ _id: string; value: number }>([
-      { $match: { type: "ORDER_REFUND", status: "COMPLETED", createdAt: { $gte: from, $lte: endOfTo } } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-          value: { $sum: { $toDouble: "$amount" } },
-        },
-      },
-    ]),
-    Transaction.aggregate<{ total: number }>([
-      { $match: { type: "DEPOSIT", status: "COMPLETED", createdAt: { $gte: from, $lte: endOfTo } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: "$amount" } } } },
-    ]),
+  const [revenueRows, orderRows, refundRows, depositRows] = await Promise.all([
+    prisma.$queryRaw<DayValueRow[]>`
+      SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, SUM(amount)::float AS value
+      FROM "Transaction"
+      WHERE type = 'ORDER_PAYMENT' AND status = 'COMPLETED' AND "createdAt" >= ${from} AND "createdAt" <= ${endOfTo}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw<DayValueRow[]>`
+      SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, COUNT(*)::int AS value
+      FROM "Order"
+      WHERE "createdAt" >= ${from} AND "createdAt" <= ${endOfTo}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw<DayValueRow[]>`
+      SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, SUM(amount)::float AS value
+      FROM "Transaction"
+      WHERE type = 'ORDER_REFUND' AND status = 'COMPLETED' AND "createdAt" >= ${from} AND "createdAt" <= ${endOfTo}
+      GROUP BY 1
+    `,
+    prisma.$queryRaw<{ total: number | string | null }[]>`
+      SELECT SUM(amount)::float AS total
+      FROM "Transaction"
+      WHERE type = 'DEPOSIT' AND status = 'COMPLETED' AND "createdAt" >= ${from} AND "createdAt" <= ${endOfTo}
+    `,
   ]);
 
-  const revenueMap = new Map(revenueAgg.map((p) => [p._id, p.value]));
-  const orderMap = new Map(orderAgg.map((p) => [p._id, p.value]));
-  const refundMap = new Map(refundAgg.map((p) => [p._id, p.value]));
+  const revenueMap = new Map(revenueRows.map((p) => [p.day, Number(p.value ?? 0)]));
+  const orderMap = new Map(orderRows.map((p) => [p.day, Number(p.value ?? 0)]));
+  const refundMap = new Map(refundRows.map((p) => [p.day, Number(p.value ?? 0)]));
 
   const days = Math.max(1, Math.round((endOfTo.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)) + 1);
   const rows: FinancialReportRow[] = [];
@@ -314,7 +305,7 @@ export async function getFinancialReportRows(from: Date, to: Date): Promise<Fina
     totalRevenue: rows.reduce((sum, r) => sum + r.revenue, 0),
     totalOrders: rows.reduce((sum, r) => sum + r.orderCount, 0),
     totalRefunds: rows.reduce((sum, r) => sum + r.refunds, 0),
-    totalDeposits: depositAgg[0]?.total ?? 0,
+    totalDeposits: Number(depositRows[0]?.total ?? 0),
   };
 }
 
@@ -327,26 +318,19 @@ export interface UserSpendingSeries {
 export async function getUserSpendingSeries(userId: string, days: number): Promise<UserSpendingSeries> {
   const since = daysAgo(days);
 
-  const agg = await Transaction.aggregate<{ _id: string; value: number }>([
-    {
-      $match: {
-        userId: new Types.ObjectId(userId),
-        type: "ORDER_PAYMENT",
-        status: "COMPLETED",
-        createdAt: { $gte: since },
-      },
-    },
-    {
-      $group: {
-        _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-        value: { $sum: { $toDouble: "$amount" } },
-      },
-    },
-  ]);
+  const rows = await prisma.$queryRaw<DayValueRow[]>`
+    SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS day, SUM(amount)::float AS value
+    FROM "Transaction"
+    WHERE "userId" = ${userId} AND type = 'ORDER_PAYMENT' AND status = 'COMPLETED' AND "createdAt" >= ${since}
+    GROUP BY 1
+  `;
 
-  const spending = fillSeries(days, agg);
+  const spending = fillSeries(
+    days,
+    rows.map((r) => ({ day: r.day, value: Number(r.value ?? 0) }))
+  );
   return { spending, totalSpending: spending.reduce((sum, p) => sum + p.value, 0) };
 }
 
-/** Re-exported for convenience at call sites that already have a Decimal128 and want a plain number. */
+/** Re-exported for convenience at call sites that already have a Decimal and want a plain number. */
 export { decimalToNumber };

@@ -1,9 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { connectDB } from "@/lib/db";
-import { VerificationToken } from "@/models/VerificationToken";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { hashToken } from "@/lib/crypto";
 import { requestLogger } from "@/lib/logger";
 
@@ -12,8 +10,6 @@ const schema = z.object({ token: z.string().min(1) });
 export async function POST(request: Request) {
   const log = requestLogger(request);
   try {
-    await connectDB();
-
     const body = await request.json();
     const parsed = schema.safeParse(body);
     if (!parsed.success) {
@@ -22,21 +18,25 @@ export async function POST(request: Request) {
 
     const tokenHash = hashToken(parsed.data.token);
 
-    const record = await VerificationToken.findOne({
-      tokenHash,
-      purpose: "EMAIL_VERIFY",
-      usedAt: null,
-      expiresAt: { $gt: new Date() },
+    const record = await prisma.verificationToken.findFirst({
+      where: {
+        tokenHash,
+        purpose: "EMAIL_VERIFY",
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
     });
 
     if (!record) {
       return NextResponse.json({ error: "This verification link is invalid or has expired." }, { status: 400 });
     }
 
-    await User.findByIdAndUpdate(record.userId, { emailVerified: new Date() });
+    await prisma.user.update({ where: { id: record.userId }, data: { emailVerified: new Date() } });
 
-    record.usedAt = new Date();
-    await record.save();
+    await prisma.verificationToken.update({
+      where: { id: record.id },
+      data: { usedAt: new Date() },
+    });
 
     return NextResponse.json({ message: "Email verified successfully." });
   } catch (error) {

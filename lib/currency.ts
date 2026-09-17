@@ -1,5 +1,5 @@
-import { connectDB } from "@/lib/db";
-import { ExchangeRateCache } from "@/models/ExchangeRateCache";
+import { prisma } from "@/lib/db";
+import type { Prisma } from "@/lib/generated/prisma";
 import type { DisplayCurrency } from "@/lib/currency-format";
 import { logger } from "@/lib/logger";
 
@@ -83,22 +83,20 @@ async function fetchLiveRates(): Promise<RatesSnapshot> {
  * actually held/charged.
  */
 export async function getExchangeRates(): Promise<RatesSnapshot> {
-  await connectDB();
-
-  const cached = await ExchangeRateCache.findOne({ key: "latest" }).lean();
+  const cached = await prisma.exchangeRateCache.findUnique({ where: { key: "latest" } });
   const isFresh = cached && Date.now() - new Date(cached.fetchedAt).getTime() < CACHE_TTL_MS;
 
   if (isFresh) {
-    return { base: "USD", rates: cached.rates, fetchedAt: new Date(cached.fetchedAt) };
+    return { base: "USD", rates: cached.rates as Record<string, number>, fetchedAt: new Date(cached.fetchedAt) };
   }
 
   try {
     const live = await fetchLiveRates();
-    await ExchangeRateCache.updateOne(
-      { key: "latest" },
-      { $set: { base: "USD", rates: live.rates, fetchedAt: live.fetchedAt } },
-      { upsert: true }
-    );
+    await prisma.exchangeRateCache.upsert({
+      where: { key: "latest" },
+      update: { base: "USD", rates: live.rates as Prisma.InputJsonValue, fetchedAt: live.fetchedAt },
+      create: { key: "latest", base: "USD", rates: live.rates as Prisma.InputJsonValue, fetchedAt: live.fetchedAt },
+    });
     return live;
   } catch (err) {
     if (cached) {
@@ -106,7 +104,7 @@ export async function getExchangeRates(): Promise<RatesSnapshot> {
         { err, staleSince: cached.fetchedAt.toISOString() },
         "[currency] Live FX fetch failed, serving stale cached rates"
       );
-      return { base: "USD", rates: cached.rates, fetchedAt: new Date(cached.fetchedAt) };
+      return { base: "USD", rates: cached.rates as Record<string, number>, fetchedAt: new Date(cached.fetchedAt) };
     }
     // No cache at all yet (first run) and the live fetch failed — genuinely
     // nothing to convert with. Callers must handle this by falling back to

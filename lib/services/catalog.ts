@@ -1,6 +1,4 @@
-import { Service } from "@/models/Service";
-import { Category } from "@/models/Category";
-import { ServiceGroup } from "@/models/ServiceGroup";
+import { prisma } from "@/lib/db";
 
 /**
  * Shared catalog-tree query, used by BOTH the authenticated `/api/services`
@@ -14,15 +12,20 @@ import { ServiceGroup } from "@/models/ServiceGroup";
  * Returns the full 3-level tree: ServiceGroup -> Category -> Service.
  * Categories/services with no group are returned under a synthetic
  * `null`-id "ungrouped" bucket rather than dropped, since a group is
- * optional (see models/ServiceGroup.ts) and today's seed data has no
- * groups assigned at all — omitting ungrouped items would currently mean
- * omitting the entire catalog.
+ * optional (see prisma/schema.prisma's ServiceGroup model) and today's seed
+ * data has no groups assigned at all — omitting ungrouped items would
+ * currently mean omitting the entire catalog.
  *
  * Deliberately excludes provider-identifying fields
  * (`providerId`/`providerServiceId`/`providerRate`) from every `Service`
  * returned — this is customer/public-facing data. This exclusion must be
  * kept in sync with (or stricter than) the equivalent projection in
  * app/api/services/route.ts's authenticated route.
+ *
+ * NOTE: the `_id` field naming on these DTOs is a deliberate holdover from
+ * the original Mongoose-era API contract (kept identical so no frontend
+ * code needed to change as part of the Postgres migration), even though
+ * the underlying Prisma model's primary key column is named `id`.
  */
 export interface CatalogService {
   _id: string;
@@ -54,20 +57,30 @@ export interface CatalogGroup {
 
 export async function getPublicCatalog(): Promise<{ groups: CatalogGroup[]; totalServices: number }> {
   const [groups, categories, services] = await Promise.all([
-    ServiceGroup.find({ active: true }).sort({ sortOrder: 1, name: 1 }).lean(),
-    Category.find({ active: true }).sort({ sortOrder: 1, name: 1 }).lean(),
-    Service.find({ active: true, hidden: false })
-      .select("-providerId -providerServiceId -providerRate")
-      .sort({ name: 1 })
-      .lean(),
+    prisma.serviceGroup.findMany({ where: { active: true }, orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }),
+    prisma.category.findMany({ where: { active: true }, orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }),
+    prisma.service.findMany({
+      where: { active: true, hidden: false },
+      orderBy: { name: "asc" },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        rate: true,
+        minQuantity: true,
+        maxQuantity: true,
+        categoryId: true,
+        estimatedDeliveryMinutes: true,
+      },
+    }),
   ]);
 
   const servicesByCategory = new Map<string, CatalogService[]>();
   for (const s of services) {
-    const key = s.categoryId.toString();
+    const key = s.categoryId;
     const list = servicesByCategory.get(key) ?? [];
     list.push({
-      _id: s._id.toString(),
+      _id: s.id,
       name: s.name,
       description: s.description,
       rate: s.rate.toString(),
@@ -82,14 +95,14 @@ export async function getPublicCatalog(): Promise<{ groups: CatalogGroup[]; tota
   const categoriesByGroup = new Map<string | null, CatalogCategory[]>();
   let totalServices = 0;
   for (const c of categories) {
-    const catServices = servicesByCategory.get(c._id.toString()) ?? [];
+    const catServices = servicesByCategory.get(c.id) ?? [];
     if (catServices.length === 0) continue; // hide empty categories from the public catalog
     totalServices += catServices.length;
 
-    const groupKey = c.groupId ? c.groupId.toString() : null;
+    const groupKey = c.groupId ?? null;
     const list = categoriesByGroup.get(groupKey) ?? [];
     list.push({
-      _id: c._id.toString(),
+      _id: c.id,
       name: c.name,
       slug: c.slug,
       description: c.description,
@@ -101,10 +114,10 @@ export async function getPublicCatalog(): Promise<{ groups: CatalogGroup[]; tota
 
   const result: CatalogGroup[] = [];
   for (const g of groups) {
-    const cats = categoriesByGroup.get(g._id.toString());
+    const cats = categoriesByGroup.get(g.id);
     if (!cats || cats.length === 0) continue;
     result.push({
-      _id: g._id.toString(),
+      _id: g.id,
       name: g.name,
       icon: g.icon,
       categories: cats,

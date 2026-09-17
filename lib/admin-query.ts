@@ -17,23 +17,28 @@ export function parseStatusList(raw: string | null | undefined): string[] | unde
   return list.length > 0 ? list : undefined;
 }
 
-/** Inclusive `[from, to]` date range for a `createdAt`-style field. `to` is extended to end-of-day. */
+/**
+ * Inclusive `[from, to]` date range for a `createdAt`-style field. `to` is
+ * extended to end-of-day. Keys are Prisma's own filter shape (`gte`/`lte`)
+ * — was `$gte`/`$lte` (MongoDB) before this migration; every caller passes
+ * this straight into a Prisma `where` clause.
+ */
 export function parseDateRange(
   fromRaw: string | null | undefined,
   toRaw: string | null | undefined
-): { $gte?: Date; $lte?: Date } | undefined {
-  const range: { $gte?: Date; $lte?: Date } = {};
+): { gte?: Date; lte?: Date } | undefined {
+  const range: { gte?: Date; lte?: Date } = {};
 
   if (fromRaw) {
     const from = new Date(fromRaw);
-    if (!Number.isNaN(from.getTime())) range.$gte = from;
+    if (!Number.isNaN(from.getTime())) range.gte = from;
   }
 
   if (toRaw) {
     const to = new Date(toRaw);
     if (!Number.isNaN(to.getTime())) {
       to.setHours(23, 59, 59, 999);
-      range.$lte = to;
+      range.lte = to;
     }
   }
 
@@ -50,7 +55,7 @@ export interface ParsedListQuery {
   limit: number;
   status?: string[];
   search?: string;
-  dateRange?: { $gte?: Date; $lte?: Date };
+  dateRange?: { gte?: Date; lte?: Date };
 }
 
 /** Parses the common `page`/`limit`/`status`/`search`/`from`/`to` shape shared by every admin list page/route. */

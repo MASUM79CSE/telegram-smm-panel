@@ -1,9 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Category } from "@/models/Category";
-import { Service } from "@/models/Service";
-import { ServiceGroup } from "@/models/ServiceGroup";
+import { prisma } from "@/lib/db";
 import { categorySchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -16,7 +13,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -28,7 +24,7 @@ export async function PATCH(
   const update: typeof parsed.data = { ...parsed.data };
   if ("groupId" in update) {
     if (update.groupId) {
-      const exists = await ServiceGroup.exists({ _id: update.groupId });
+      const exists = await prisma.serviceGroup.findUnique({ where: { id: update.groupId }, select: { id: true } });
       if (!exists) {
         return NextResponse.json({ error: "Service group not found" }, { status: 400 });
       }
@@ -37,7 +33,7 @@ export async function PATCH(
     }
   }
 
-  const category = await Category.findByIdAndUpdate(id, update, { returnDocument: "after" });
+  const category = await prisma.category.update({ where: { id }, data: update }).catch(() => null);
   if (!category) {
     return NextResponse.json({ error: "Category not found" }, { status: 404 });
   }
@@ -63,10 +59,9 @@ export async function DELETE(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
-  const serviceCount = await Service.countDocuments({ categoryId: id });
+  const serviceCount = await prisma.service.count({ where: { categoryId: id } });
   if (serviceCount > 0) {
     return NextResponse.json(
       { error: `Cannot delete: ${serviceCount} service(s) still belong to this category.` },
@@ -74,7 +69,7 @@ export async function DELETE(
     );
   }
 
-  const category = await Category.findByIdAndDelete(id);
+  const category = await prisma.category.delete({ where: { id } }).catch(() => null);
   if (!category) {
     return NextResponse.json({ error: "Category not found" }, { status: 404 });
   }

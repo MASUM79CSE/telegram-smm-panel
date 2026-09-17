@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect, useCallback, Fragment } from "react";
 import { getAuditActionMeta, AUDIT_CATEGORY_COLORS } from "@/lib/audit-labels";
-import type { AuditAction } from "@/models/AuditLog";
+import type { AuditAction } from "@/lib/generated/prisma";
 
 interface AuditEntry {
   _id: string;

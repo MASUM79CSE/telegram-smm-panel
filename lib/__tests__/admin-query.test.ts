@@ -34,21 +34,21 @@ describe("lib/admin-query", () => {
 
     it("parses only a `from` bound", () => {
       const range = parseDateRange("2026-01-01", null);
-      expect(range?.$gte?.toISOString().slice(0, 10)).toBe("2026-01-01");
-      expect(range?.$lte).toBeUndefined();
+      expect(range?.gte?.toISOString().slice(0, 10)).toBe("2026-01-01");
+      expect(range?.lte).toBeUndefined();
     });
 
     it("parses only a `to` bound and extends it to end-of-day", () => {
       const range = parseDateRange(null, "2026-01-01");
-      expect(range?.$gte).toBeUndefined();
-      expect(range?.$lte?.getHours()).toBe(23);
-      expect(range?.$lte?.getMinutes()).toBe(59);
+      expect(range?.gte).toBeUndefined();
+      expect(range?.lte?.getHours()).toBe(23);
+      expect(range?.lte?.getMinutes()).toBe(59);
     });
 
     it("parses both bounds", () => {
       const range = parseDateRange("2026-01-01", "2026-01-31");
-      expect(range?.$gte).toBeInstanceOf(Date);
-      expect(range?.$lte).toBeInstanceOf(Date);
+      expect(range?.gte).toBeInstanceOf(Date);
+      expect(range?.lte).toBeInstanceOf(Date);
     });
 
     it("ignores invalid date strings", () => {
@@ -57,8 +57,8 @@ describe("lib/admin-query", () => {
 
     it("ignores an invalid `from` while keeping a valid `to`", () => {
       const range = parseDateRange("garbage", "2026-01-31");
-      expect(range?.$gte).toBeUndefined();
-      expect(range?.$lte).toBeInstanceOf(Date);
+      expect(range?.gte).toBeUndefined();
+      expect(range?.lte).toBeInstanceOf(Date);
     });
   });
 
@@ -107,8 +107,8 @@ describe("lib/admin-query", () => {
       expect(q.limit).toBe(50);
       expect(q.status).toEqual(["PENDING", "FAILED"]);
       expect(q.search).toBe("alice");
-      expect(q.dateRange?.$gte).toBeInstanceOf(Date);
-      expect(q.dateRange?.$lte).toBeInstanceOf(Date);
+      expect(q.dateRange?.gte).toBeInstanceOf(Date);
+      expect(q.dateRange?.lte).toBeInstanceOf(Date);
     });
 
     it("clamps limit to the given max", () => {

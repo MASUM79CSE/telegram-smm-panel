@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { favoriteServiceSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 import { requestLogger } from "@/lib/logger";
@@ -19,11 +18,13 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await connectDB();
-  const user = await User.findById(session.user.id).select("favoriteServiceIds").lean();
+  const favorites = await prisma.favoriteService.findMany({
+    where: { userId: session.user.id },
+    select: { serviceId: true },
+  });
 
   return NextResponse.json({
-    favoriteServiceIds: (user?.favoriteServiceIds ?? []).map((id) => id.toString()),
+    favoriteServiceIds: favorites.map((f) => f.serviceId),
   });
 }
 
@@ -41,11 +42,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid input" }, { status: 400 });
     }
 
-    await connectDB();
-    await User.updateOne(
-      { _id: session.user.id },
-      { $addToSet: { favoriteServiceIds: parsed.data.serviceId } }
-    );
+    // Idempotent add: upsert on the composite PK, no-op if already favorited.
+    await prisma.favoriteService.upsert({
+      where: { userId_serviceId: { userId: session.user.id, serviceId: parsed.data.serviceId } },
+      update: {},
+      create: { userId: session.user.id, serviceId: parsed.data.serviceId },
+    });
 
     await recordAudit({
       actorId: session.user.id,
@@ -77,11 +79,10 @@ export async function DELETE(request: Request) {
       return NextResponse.json({ error: "Invalid input" }, { status: 400 });
     }
 
-    await connectDB();
-    await User.updateOne(
-      { _id: session.user.id },
-      { $pull: { favoriteServiceIds: parsed.data.serviceId } }
-    );
+    // Idempotent remove: no-op if the favorite doesn't exist.
+    await prisma.favoriteService.deleteMany({
+      where: { userId: session.user.id, serviceId: parsed.data.serviceId },
+    });
 
     await recordAudit({
       actorId: session.user.id,

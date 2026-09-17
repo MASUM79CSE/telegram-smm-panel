@@ -1,7 +1,7 @@
-import { ApiKey, type IApiKey } from "@/models/ApiKey";
+import { prisma } from "@/lib/db";
+import type { ApiKey } from "@/lib/generated/prisma";
 import { hashToken, generateRawToken } from "@/lib/crypto";
 import { AppError } from "@/lib/errors";
-import type { HydratedDocument } from "mongoose";
 import { logger } from "@/lib/logger";
 
 /**
@@ -18,16 +18,18 @@ const KEY_PREFIX = "smm_live_";
 export async function createApiKey(params: {
   userId: string;
   label?: string | null;
-}): Promise<{ apiKey: HydratedDocument<IApiKey>; rawKey: string }> {
+}): Promise<{ apiKey: ApiKey; rawKey: string }> {
   const raw = `${KEY_PREFIX}${generateRawToken()}`;
   const keyHash = hashToken(raw);
 
-  const apiKey = await ApiKey.create({
-    userId: params.userId,
-    keyHash,
-    keyPrefix: raw.slice(0, KEY_PREFIX.length + 8),
-    label: params.label ?? null,
-    active: true,
+  const apiKey = await prisma.apiKey.create({
+    data: {
+      userId: params.userId,
+      keyHash,
+      keyPrefix: raw.slice(0, KEY_PREFIX.length + 8),
+      label: params.label ?? null,
+      active: true,
+    },
   });
 
   return { apiKey, rawKey: raw };
@@ -35,25 +37,25 @@ export async function createApiKey(params: {
 
 /**
  * Resolves a raw API key (as sent by a reseller in `/api/v2` requests) to
- * its owning, active `ApiKey` document. Also stamps `lastUsedAt` — best
- * effort, not awaited by callers that don't need to block on it.
+ * its owning, active `ApiKey` row. Also stamps `lastUsedAt` — best effort,
+ * not awaited by callers that don't need to block on it.
  */
-export async function resolveApiKey(rawKey: string): Promise<HydratedDocument<IApiKey>> {
+export async function resolveApiKey(rawKey: string): Promise<ApiKey> {
   if (!rawKey || typeof rawKey !== "string") {
     throw new AppError("INVALID_API_KEY", "Invalid API key.");
   }
 
   const keyHash = hashToken(rawKey);
-  const apiKey = await ApiKey.findOne({ keyHash, active: true });
+  const apiKey = await prisma.apiKey.findFirst({ where: { keyHash, active: true } });
 
   if (!apiKey) {
     throw new AppError("INVALID_API_KEY", "Invalid API key.");
   }
 
   // Fire-and-forget — must never block or fail the actual request.
-  ApiKey.updateOne({ _id: apiKey._id }, { $set: { lastUsedAt: new Date() } }).catch((err) =>
-    logger.error({ err, apiKeyId: apiKey._id.toString() }, "[api-keys] Failed to stamp lastUsedAt")
-  );
+  prisma.apiKey
+    .update({ where: { id: apiKey.id }, data: { lastUsedAt: new Date() } })
+    .catch((err) => logger.error({ err, apiKeyId: apiKey.id }, "[api-keys] Failed to stamp lastUsedAt"));
 
   return apiKey;
 }

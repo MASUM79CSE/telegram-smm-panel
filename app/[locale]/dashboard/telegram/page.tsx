@@ -1,16 +1,14 @@
 import { getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { TelegramLinkPanel } from "@/components/dashboard/telegram-link-panel";
 import { env } from "@/lib/env";
 
 export default async function TelegramPage() {
   const session = await auth();
-  await connectDB();
   const t = await getTranslations("Dashboard.telegram");
 
-  const user = await User.findById(session!.user.id).lean();
+  const user = await prisma.user.findUnique({ where: { id: session!.user.id } });
   const botUsername = env.TELEGRAM_BOT_USERNAME ?? null;
 
   return (

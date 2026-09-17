@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { userStatusSchema, userRoleSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -13,8 +12,6 @@ export async function PATCH(
   if (!session?.user?.id || session.user.role !== "ADMIN") {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
-
-  await connectDB();
 
   const { id } = await params;
 
@@ -31,11 +28,17 @@ export async function PATCH(
     return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });
   }
 
-  const update: Record<string, unknown> = {};
+  const update: { status?: string; role?: string } = {};
   if (statusParsed.success) update.status = statusParsed.data.status;
   if (roleParsed.success) update.role = roleParsed.data.role;
 
-  const user = await User.findByIdAndUpdate(id, update, { returnDocument: "after" }).select("-passwordHash -twoFactorSecret");
+  const user = await prisma.user
+    .update({
+      where: { id },
+      data: update as { status?: "ACTIVE" | "SUSPENDED" | "BANNED"; role?: "USER" | "ADMIN" },
+      omit: { passwordHash: true, twoFactorSecret: true },
+    })
+    .catch(() => null);
 
   if (!user) {
     return NextResponse.json({ error: "User not found" }, { status: 404 });

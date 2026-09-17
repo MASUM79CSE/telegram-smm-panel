@@ -1,11 +1,7 @@
-import mongoose from "mongoose";
-import type { HydratedDocument } from "mongoose";
-
-import { Order, type IOrder } from "@/models/Order";
-import { Wallet } from "@/models/Wallet";
-import { Transaction } from "@/models/Transaction";
-import { addMoney, calculateCharge } from "@/lib/money";
+import { prisma } from "@/lib/db";
+import { addMoney, calculateCharge, decimalToNumber } from "@/lib/money";
 import { AppError } from "@/lib/errors";
+import type { Order } from "@/lib/generated/prisma";
 
 /**
  * Automatic partial-delivery refund (docs/IMPLEMENTATION_PLAN.md Phase 3.2).
@@ -30,96 +26,88 @@ import { AppError } from "@/lib/errors";
  * this is real money movement and a status-polling worker could plausibly
  * be invoked concurrently for the same order from two overlapping runs.
  */
-export async function issuePartialRefund(
-  orderId: string,
-  remains: number
-): Promise<HydratedDocument<IOrder> | null> {
-  const mongoSession = await mongoose.startSession();
-  let updatedOrder: HydratedDocument<IOrder> | undefined;
+export async function issuePartialRefund(orderId: string, remains: number): Promise<Order | null> {
+  return prisma.$transaction(async (tx) => {
+    const now = new Date();
 
-  try {
-    await mongoSession.withTransaction(async () => {
-      const now = new Date();
+    // Atomic claim: only one concurrent poll can win the refund for this order.
+    const claim = await tx.order.updateMany({
+      where: { id: orderId, status: "IN_PROGRESS", partialRefundIssuedAt: null },
+      data: { partialRefundIssuedAt: now },
+    });
 
-      // Atomic claim: only one concurrent poll can win the refund for this order.
-      const claim = await Order.updateOne(
-        { _id: orderId, status: "IN_PROGRESS", partialRefundIssuedAt: null },
-        { $set: { partialRefundIssuedAt: now } }
-      ).session(mongoSession);
+    if (claim.count !== 1) {
+      // Already refunded (or no longer IN_PROGRESS) — not an error, just a no-op.
+      return null;
+    }
 
-      if (claim.modifiedCount !== 1) {
-        // Already refunded (or no longer IN_PROGRESS) — not an error, just a no-op.
-        return;
-      }
+    const order = await tx.order.findUnique({ where: { id: orderId } });
+    if (!order) throw new AppError("NOT_FOUND", "Order not found.");
 
-      const order = await Order.findById(orderId).session(mongoSession);
-      if (!order) throw new AppError("NOT_FOUND", "Order not found.");
+    const quantity = order.quantity;
+    const clampedRemains = Math.max(0, Math.min(remains, quantity));
+    if (clampedRemains <= 0) return order;
 
-      const quantity = order.quantity;
-      const clampedRemains = Math.max(0, Math.min(remains, quantity));
-      if (clampedRemains <= 0) return;
+    // Proportional share of the ORIGINAL charge corresponding to the
+    // undelivered quantity — reuses the same rate-based math as
+    // `lib/money.ts#calculateCharge` by treating (remains/quantity) as an
+    // effective "rate per unit quantity" scaled the same way, so this
+    // never independently reinvents money-rounding rules.
+    const refundAmount = calculateCharge(
+      // charge is already a Decimal total for `quantity` units at the
+      // service's rate-per-1000; the equivalent "rate per 1000 remaining
+      // units" that reproduces the same total-charge math for a
+      // `clampedRemains`-sized order is: (charge / quantity) * 1000.
+      (decimalToNumber(order.charge) / quantity) * 1000,
+      clampedRemains
+    );
 
-      // Proportional share of the ORIGINAL charge corresponding to the
-      // undelivered quantity — reuses the same rate-based math as
-      // `lib/money.ts#calculateCharge` by treating (remains/quantity) as an
-      // effective "rate per unit quantity" scaled the same way, so this
-      // never independently reinvents money-rounding rules.
-      const refundAmount = calculateCharge(
-        // charge is already a Decimal128 total for `quantity` units at the
-        // service's rate-per-1000; the equivalent "rate per 1000 remaining
-        // units" that reproduces the same total-charge math for a
-        // `clampedRemains`-sized order is: (charge / quantity) * 1000.
-        (Number(order.charge.toString()) / quantity) * 1000,
-        clampedRemains
-      );
+    const wallet = await tx.wallet.findUnique({ where: { userId: order.userId } });
+    if (!wallet) throw new AppError("WALLET_NOT_FOUND", "User wallet not found.");
 
-      const wallet = await Wallet.findOne({ userId: order.userId }).session(mongoSession);
-      if (!wallet) throw new AppError("WALLET_NOT_FOUND", "User wallet not found.");
+    const balanceBefore = wallet.balance;
+    const balanceAfter = addMoney(wallet.balance, refundAmount);
 
-      const balanceBefore = wallet.balance;
-      const balanceAfter = addMoney(wallet.balance, refundAmount);
+    const walletUpdate = await tx.wallet.updateMany({
+      where: { id: wallet.id, version: wallet.version },
+      data: { balance: balanceAfter, version: { increment: 1 } },
+    });
 
-      const walletUpdate = await Wallet.updateOne(
-        { _id: wallet._id, version: wallet.version },
-        { $set: { balance: balanceAfter }, $inc: { version: 1 } }
-      ).session(mongoSession);
+    if (walletUpdate.count !== 1) {
+      throw new AppError("CONCURRENT_MODIFICATION", "Please try again — a concurrent update occurred.");
+    }
 
-      if (walletUpdate.modifiedCount !== 1) {
-        throw new AppError("CONCURRENT_MODIFICATION", "Please try again — a concurrent update occurred.");
-      }
+    await tx.transaction.create({
+      data: {
+        userId: order.userId,
+        walletId: wallet.id,
+        type: "ORDER_REFUND",
+        status: "COMPLETED",
+        amount: refundAmount,
+        balanceBefore,
+        balanceAfter,
+        description: `Partial-delivery refund for order ${order.id} (${clampedRemains}/${quantity} undelivered)`,
+        relatedOrderId: order.id,
+        idempotencyKey: `partial-refund:${order.id}`,
+      },
+    });
 
-      await Transaction.create(
-        [
+    const existingHistory = Array.isArray(order.statusHistory) ? order.statusHistory : [];
+
+    return tx.order.update({
+      where: { id: order.id },
+      data: {
+        status: "PARTIAL",
+        remains: clampedRemains,
+        statusHistory: [
+          ...existingHistory,
           {
-            userId: order.userId,
-            walletId: wallet._id,
-            type: "ORDER_REFUND",
-            status: "COMPLETED",
-            amount: refundAmount,
-            balanceBefore,
-            balanceAfter,
-            description: `Partial-delivery refund for order ${order._id.toString()} (${clampedRemains}/${quantity} undelivered)`,
-            relatedOrderId: order._id,
-            idempotencyKey: `partial-refund:${order._id.toString()}`,
+            status: "PARTIAL",
+            note: `Provider reported ${clampedRemains}/${quantity} undelivered — auto-refunded proportionally.`,
+            at: now.toISOString(),
           },
         ],
-        { session: mongoSession }
-      );
-
-      order.status = "PARTIAL";
-      order.remains = clampedRemains;
-      order.statusHistory.push({
-        status: "PARTIAL",
-        note: `Provider reported ${clampedRemains}/${quantity} undelivered — auto-refunded proportionally.`,
-        at: now,
-      });
-      await order.save({ session: mongoSession });
-
-      updatedOrder = order;
+      },
     });
-  } finally {
-    await mongoSession.endSession();
-  }
-
-  return updatedOrder ?? null;
+  });
 }

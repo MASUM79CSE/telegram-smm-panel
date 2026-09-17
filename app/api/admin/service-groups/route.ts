@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ServiceGroup } from "@/models/ServiceGroup";
+import { prisma } from "@/lib/db";
 import { serviceGroupSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -19,8 +18,7 @@ export async function GET() {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-  const groups = await ServiceGroup.find().sort({ sortOrder: 1, name: 1 }).lean();
+  const groups = await prisma.serviceGroup.findMany({ orderBy: [{ sortOrder: "asc" }, { name: "asc" }] });
   return NextResponse.json({ groups });
 }
 
@@ -30,8 +28,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const body = await request.json();
   const parsed = serviceGroupSchema.safeParse(body);
   if (!parsed.success) {
@@ -40,19 +36,19 @@ export async function POST(request: Request) {
 
   const slug = slugify(parsed.data.name);
 
-  const existing = await ServiceGroup.findOne({ $or: [{ name: parsed.data.name }, { slug }] });
+  const existing = await prisma.serviceGroup.findFirst({ where: { OR: [{ name: parsed.data.name }, { slug }] } });
   if (existing) {
     return NextResponse.json({ error: "A service group with this name already exists." }, { status: 409 });
   }
 
-  const group = await ServiceGroup.create({ ...parsed.data, slug });
+  const group = await prisma.serviceGroup.create({ data: { ...parsed.data, slug } });
 
   await recordAudit({
     actorId: session.user.id,
     actorEmail: session.user.email,
     action: "SERVICE_GROUP_CREATED",
     targetType: "ServiceGroup",
-    targetId: group._id.toString(),
+    targetId: group.id,
     request,
   });
 

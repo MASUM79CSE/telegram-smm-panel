@@ -1,6 +1,6 @@
 import type { Page } from "@playwright/test";
-import mongoose from "mongoose";
 import { readFileSync } from "fs";
+import { PrismaClient } from "../lib/generated/prisma";
 
 /**
  * Shared helpers for the e2e smoke suite. Kept intentionally small — these
@@ -11,16 +11,20 @@ import { readFileSync } from "fs";
  * to complete a flow.
  */
 
-export async function connectToTestDb(): Promise<typeof mongoose> {
-  if (mongoose.connection.readyState === 1) return mongoose;
-  const uri = process.env.MONGODB_URI;
+let testDbClient: PrismaClient | undefined;
+
+export function connectToTestDb(): PrismaClient {
+  if (testDbClient) return testDbClient;
+  const uri = process.env.DATABASE_URL;
   if (!uri) {
     throw new Error(
-      "MONGODB_URI is not set — e2e helpers must run after globalSetup has populated it (see e2e/global-setup.ts)."
+      "DATABASE_URL is not set — e2e helpers must run after globalSetup has populated it (see e2e/global-setup.ts)."
     );
   }
-  return mongoose.connect(uri, { dbName: "e2e" });
+  testDbClient = new PrismaClient({ datasourceUrl: uri });
+  return testDbClient;
 }
+
 
 /** Fills and submits the login form, using the exact field labels/placeholders the real LoginForm component renders. */
 export async function loginAs(page: Page, email: string, password: string): Promise<void> {

@@ -1,13 +1,14 @@
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
-import { Provider, type IProvider } from "@/models/Provider";
-import { Service } from "@/models/Service";
-import { ServiceProvider } from "@/models/ServiceProvider";
+import { connectDB, prisma } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
 import { changeOrderStatus } from "@/lib/services/admin-orders";
 import { issuePartialRefund } from "@/lib/services/refunds";
-import type { HydratedDocument } from "mongoose";
 import { logger } from "@/lib/logger";
+import type { Order, Provider, Prisma } from "@/lib/generated/prisma";
+
+function appendHistory(order: { statusHistory: Prisma.JsonValue }, status: string, note: string, at: Date) {
+  const existing = Array.isArray(order.statusHistory) ? order.statusHistory : [];
+  return [...existing, { status, note, at: at.toISOString() }];
+}
 
 /**
  * Fulfillment layer — dispatches a PENDING order to its provider.
@@ -40,38 +41,35 @@ import { logger } from "@/lib/logger";
 export async function dispatchOrderToProvider(orderId: string): Promise<void> {
   await connectDB();
 
-  const order = await Order.findById(orderId);
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
   // Retry-eligible states: a fresh PENDING order, or a PROCESSING order that
   // got there because every candidate provider failed this round (signaled
   // by a non-null `lastError` — cleared to null on any successful dispatch,
   // including the MANUAL "awaiting human" outcome). This distinction matters
   // because PROCESSING is overloaded: it also means "successfully handed to
   // a MANUAL provider, awaiting a human" (lastError === null in that case),
-  // which must NOT be re-dispatched on every worker pass. Found live during
-  // Phase 2.1 verification: without this, the worker's own candidate query
-  // (`status IN (PENDING, PROCESSING)`) was selecting failed orders that
-  // this function's guard then silently no-op'd forever — MAX_ATTEMPTS-based
-  // retry never actually happened for any order that failed at least once,
-  // contradicting docs/ARCHITECTURE.md's documented resilience design.
+  // which must NOT be re-dispatched on every worker pass.
   const isRetryEligibleFailure = order?.status === "PROCESSING" && order.lastError != null;
   if (!order || (order.status !== "PENDING" && !isRetryEligibleFailure)) return;
 
-  order.attempts += 1;
-  order.lastAttemptAt = new Date();
-
-  const candidates = await resolveDispatchCandidates(order.serviceId.toString());
+  const candidates = await resolveDispatchCandidates(order.serviceId);
 
   if (candidates.length === 0) {
-    // No provider configured at all (legacy path with providerId === null,
-    // or no ServiceProvider rows and no legacy fields either) -> requires
-    // manual fulfillment by an admin.
-    order.status = "PROCESSING";
-    order.statusHistory.push({ status: "PROCESSING", note: "Awaiting manual fulfillment", at: new Date() });
-    await order.save();
+    // No provider configured at all -> requires manual fulfillment by an admin.
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        attempts: { increment: 1 },
+        lastAttemptAt: new Date(),
+        status: "PROCESSING",
+        statusHistory: appendHistory(order, "PROCESSING", "Awaiting manual fulfillment", new Date()),
+      },
+    });
     return;
   }
 
   const attemptErrors: string[] = [];
+  const workingOrder: Order = order;
 
   for (const candidate of candidates) {
     const provider = candidate.provider;
@@ -83,59 +81,74 @@ export async function dispatchOrderToProvider(orderId: string): Promise<void> {
 
     try {
       const priorFailureNote =
-        attemptErrors.length > 0 ? ` (after ${attemptErrors.length} earlier provider failure(s) this attempt: ${attemptErrors.join("; ")})` : "";
+        attemptErrors.length > 0
+          ? ` (after ${attemptErrors.length} earlier provider failure(s) this attempt: ${attemptErrors.join("; ")})`
+          : "";
+
+      const now = new Date();
+      let update: Prisma.OrderUncheckedUpdateInput = {};
 
       if (provider.type === "MANUAL") {
-        order.providerId = provider._id;
-        order.status = "PROCESSING";
-        order.statusHistory.push({
+        update = {
+          providerId: provider.id,
           status: "PROCESSING",
-          note: `Awaiting manual fulfillment (provider: ${candidate.providerName ?? "unknown"})${priorFailureNote}`,
-          at: new Date(),
-        });
+          statusHistory: appendHistory(
+            workingOrder,
+            "PROCESSING",
+            `Awaiting manual fulfillment (provider: ${candidate.providerName ?? "unknown"})${priorFailureNote}`,
+            now
+          ),
+        };
       } else if (provider.type === "INTERNAL") {
-        const result = await runInternalFulfillment(order);
-        order.providerId = provider._id;
+        const result = await runInternalFulfillment(workingOrder);
         if (result.automated) {
-          // A real internal automation actually ran and (optionally) handed
-          // back an upstream-style reference id — genuinely in progress.
-          order.providerOrderId = result.providerOrderId ?? null;
-          order.status = "IN_PROGRESS";
-          order.statusHistory.push({
+          update = {
+            providerId: provider.id,
+            providerOrderId: result.providerOrderId ?? null,
             status: "IN_PROGRESS",
-            note: `Dispatched to internal automation (provider: ${candidate.providerName ?? "unknown"})${priorFailureNote}`,
-            at: new Date(),
-          });
+            statusHistory: appendHistory(
+              workingOrder,
+              "IN_PROGRESS",
+              `Dispatched to internal automation (provider: ${candidate.providerName ?? "unknown"})${priorFailureNote}`,
+              now
+            ),
+          };
         } else {
-          // No internal automation is actually implemented for this
-          // provider yet (see `runInternalFulfillment`'s doc comment) —
-          // do NOT claim IN_PROGRESS when nothing real happened. Fall back
-          // to the same "awaiting a human" PROCESSING state used for
-          // MANUAL providers, with a note that makes the gap visible to
-          // admins instead of silently pretending automated delivery
-          // started.
-          order.status = "PROCESSING";
-          order.statusHistory.push({
+          update = {
             status: "PROCESSING",
-            note: `Awaiting manual fulfillment — internal automation is not yet implemented for provider "${candidate.providerName ?? "unknown"}"${priorFailureNote}`,
-            at: new Date(),
-          });
+            statusHistory: appendHistory(
+              workingOrder,
+              "PROCESSING",
+              `Awaiting manual fulfillment — internal automation is not yet implemented for provider "${candidate.providerName ?? "unknown"}"${priorFailureNote}`,
+              now
+            ),
+          };
         }
       } else if (provider.type === "API") {
-        const result = await callProviderApi(order, provider, candidate.providerServiceId);
-        order.providerId = provider._id;
-        order.providerOrderId = result.orderId;
-        order.providerResponse = result.raw;
-        order.status = "IN_PROGRESS";
-        order.statusHistory.push({
+        const result = await callProviderApi(workingOrder, provider, candidate.providerServiceId);
+        update = {
+          providerId: provider.id,
+          providerOrderId: result.orderId,
+          providerResponse: result.raw as Prisma.InputJsonValue,
           status: "IN_PROGRESS",
-          note: `Dispatched to ${candidate.providerName ?? "provider"} (id: ${result.orderId})${priorFailureNote}`,
-          at: new Date(),
-        });
+          statusHistory: appendHistory(
+            workingOrder,
+            "IN_PROGRESS",
+            `Dispatched to ${candidate.providerName ?? "provider"} (id: ${result.orderId})${priorFailureNote}`,
+            now
+          ),
+        };
       }
 
-      order.lastError = null;
-      await order.save();
+      await prisma.order.update({
+        where: { id: order.id },
+        data: {
+          attempts: { increment: 1 },
+          lastAttemptAt: now,
+          lastError: null,
+          ...update,
+        } as Prisma.OrderUncheckedUpdateInput,
+      });
       return; // success — stop trying further candidates
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown dispatch error";
@@ -144,23 +157,31 @@ export async function dispatchOrderToProvider(orderId: string): Promise<void> {
     }
   }
 
-
   // Every candidate failed (or was unavailable) within this attempt — leave
   // the order in PROCESSING for the next scheduled retry pass, same
   // "never silently lose a charged order" behavior as before, now just
   // informed by every provider that was tried this round, not only one.
-  order.lastError = attemptErrors.join("; ");
-  order.status = "PROCESSING";
-  order.statusHistory.push({
-    status: "PROCESSING",
-    note: `All ${candidates.length} provider(s) failed this attempt: ${order.lastError}`,
-    at: new Date(),
+  const lastError = attemptErrors.join("; ");
+  const now = new Date();
+  await prisma.order.update({
+    where: { id: order.id },
+    data: {
+      attempts: { increment: 1 },
+      lastAttemptAt: now,
+      lastError,
+      status: "PROCESSING",
+      statusHistory: appendHistory(
+        workingOrder,
+        "PROCESSING",
+        `All ${candidates.length} provider(s) failed this attempt: ${lastError}`,
+        now
+      ),
+    },
   });
-  await order.save();
 }
 
 interface DispatchCandidate {
-  provider: HydratedDocument<IProvider> | null;
+  provider: Provider | null;
   providerName: string | null;
   providerServiceId: string;
 }
@@ -172,28 +193,27 @@ interface DispatchCandidate {
  * see the module doc comment above for why both paths exist.
  */
 async function resolveDispatchCandidates(serviceId: string): Promise<DispatchCandidate[]> {
-  // `apiKeyEncrypted` has `select: false` on the Provider schema (see
-  // models/Provider.ts) so it must be explicitly re-selected here via
-  // populate's `select` option — otherwise every API-type provider linked
-  // through ServiceProvider would incorrectly appear to be "missing API
-  // configuration" even when correctly configured (found and fixed live
-  // during Phase 2.1 verification: see MEMORY.md §7).
-  const links = await ServiceProvider.find({ serviceId, active: true })
-    .sort({ priority: 1 })
-    .populate<{ providerId: HydratedDocument<IProvider> }>({ path: "providerId", select: "+apiKeyEncrypted" });
+  const links = await prisma.serviceProvider.findMany({
+    where: { serviceId, active: true },
+    orderBy: { priority: "asc" },
+    include: { provider: true },
+  });
 
   if (links.length > 0) {
     return links.map((link) => ({
-      provider: link.providerId ?? null,
-      providerName: link.providerId?.name ?? null,
+      provider: link.provider ?? null,
+      providerName: link.provider?.name ?? null,
       providerServiceId: link.providerServiceId,
     }));
   }
 
-  const service = await Service.findById(serviceId).select("providerId providerServiceId");
+  const service = await prisma.service.findUnique({
+    where: { id: serviceId },
+    select: { providerId: true, providerServiceId: true },
+  });
   if (!service?.providerId) return [];
 
-  const provider = await Provider.findById(service.providerId).select("+apiKeyEncrypted");
+  const provider = await prisma.provider.findUnique({ where: { id: service.providerId } });
   if (!provider) return [];
 
   return [
@@ -210,11 +230,7 @@ interface ProviderApiResult {
   raw: unknown;
 }
 
-async function callProviderApi(
-  order: InstanceType<typeof Order>,
-  provider: HydratedDocument<IProvider>,
-  providerServiceId: string
-): Promise<ProviderApiResult> {
+async function callProviderApi(order: Order, provider: Provider, providerServiceId: string): Promise<ProviderApiResult> {
   if (!provider.apiUrl || !provider.apiKeyEncrypted) {
     throw new Error("Provider is missing API configuration");
   }
@@ -231,7 +247,7 @@ async function callProviderApi(
       body: new URLSearchParams({
         key: apiKey,
         action: "add",
-        service: providerServiceId || order.serviceId.toString(),
+        service: providerServiceId || order.serviceId,
         link: order.target,
         quantity: String(order.quantity),
       }),
@@ -273,10 +289,7 @@ interface ProviderRefillResult {
  * function (see `lib/services/refill.ts#requestRefill`, which routes those
  * to manual admin review instead).
  */
-export async function requestProviderRefill(
-  order: InstanceType<typeof Order>,
-  provider: HydratedDocument<IProvider>
-): Promise<ProviderRefillResult> {
+export async function requestProviderRefill(order: Order, provider: Provider): Promise<ProviderRefillResult> {
   if (!provider.apiUrl || !provider.apiKeyEncrypted) {
     throw new Error("Provider is missing API configuration");
   }
@@ -329,10 +342,7 @@ interface ProviderStatusResult {
   raw: unknown;
 }
 
-async function callProviderStatusApi(
-  order: InstanceType<typeof Order>,
-  provider: HydratedDocument<IProvider>
-): Promise<ProviderStatusResult> {
+async function callProviderStatusApi(order: Order, provider: Provider): Promise<ProviderStatusResult> {
   if (!provider.apiUrl || !provider.apiKeyEncrypted) {
     throw new Error("Provider is missing API configuration");
   }
@@ -410,12 +420,12 @@ async function callProviderStatusApi(
 export async function pollOrderStatus(orderId: string): Promise<void> {
   await connectDB();
 
-  const order = await Order.findById(orderId);
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order || order.status !== "IN_PROGRESS" || !order.providerId || !order.providerOrderId) {
     return;
   }
 
-  const provider = await Provider.findById(order.providerId).select("+apiKeyEncrypted");
+  const provider = await prisma.provider.findUnique({ where: { id: order.providerId } });
   if (!provider || provider.type !== "API") {
     return;
   }
@@ -426,26 +436,32 @@ export async function pollOrderStatus(orderId: string): Promise<void> {
   try {
     result = await callProviderStatusApi(order, provider);
   } catch (err) {
-    order.lastStatusCheckAt = now;
-    order.lastError = err instanceof Error ? err.message : "Status check failed";
-    await order.save();
+    await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        lastStatusCheckAt: now,
+        lastError: err instanceof Error ? err.message : "Status check failed",
+      },
+    });
     return;
   }
 
-  order.lastStatusCheckAt = now;
-  if (result.remains !== null) order.remains = result.remains;
-  if (result.startCount !== null && order.startCount === null) order.startCount = result.startCount;
-
   const normalized = result.status.trim().toLowerCase();
 
+  const baseUpdate: Prisma.OrderUncheckedUpdateInput = {
+    lastStatusCheckAt: now,
+    ...(result.remains !== null ? { remains: result.remains } : {}),
+    ...(result.startCount !== null && order.startCount === null ? { startCount: result.startCount } : {}),
+  };
+
   if (normalized === "completed") {
-    await order.save(); // persist remains/lastStatusCheckAt before the status transition below
+    await prisma.order.update({ where: { id: orderId }, data: baseUpdate }); // persist remains/lastStatusCheckAt first
     await changeOrderStatus(orderId, "COMPLETED", "Provider reported delivery complete");
     return;
   }
 
   if (normalized === "partial" && (result.remains ?? 0) > 0) {
-    await order.save(); // persist remains/lastStatusCheckAt before the refund
+    await prisma.order.update({ where: { id: orderId }, data: baseUpdate }); // persist remains/lastStatusCheckAt first
     await issuePartialRefund(orderId, result.remains ?? 0);
     return;
   }
@@ -453,13 +469,13 @@ export async function pollOrderStatus(orderId: string): Promise<void> {
   if (normalized === "partial") {
     // remains <= 0 despite a "Partial" report — nothing left undelivered,
     // treat as a plain completion rather than a meaningless 0-amount refund.
-    await order.save();
+    await prisma.order.update({ where: { id: orderId }, data: baseUpdate });
     await changeOrderStatus(orderId, "COMPLETED", "Provider reported delivery complete");
     return;
   }
 
   // pending / in progress / processing — nothing to transition, just persist.
-  await order.save();
+  await prisma.order.update({ where: { id: orderId }, data: baseUpdate });
 }
 
 interface InternalFulfillmentResult {
@@ -472,11 +488,12 @@ interface InternalFulfillmentResult {
  * Dispatch point for `INTERNAL`-type providers — fulfillment performed by
  * this platform's own bot/automation rather than an external HTTP API or a
  * human admin. No default "engagement" behavior is implemented here on
- * purpose (see `models/Provider.ts`'s compliance note: this platform does
- * not ship fake-engagement automation). If/when a specific compliant
- * internal action is defined (e.g. a Telegram bot action this organization
- * is directly authorized to run against consenting users), implement it in
- * this function and set `automated: true` once it actually runs.
+ * purpose (see `prisma/schema.prisma`'s Provider model compliance note:
+ * this platform does not ship fake-engagement automation). If/when a
+ * specific compliant internal action is defined (e.g. a Telegram bot
+ * action this organization is directly authorized to run against
+ * consenting users), implement it in this function and set
+ * `automated: true` once it actually runs.
  *
  * Until then, this deliberately reports `automated: false` so the caller
  * (`dispatchOrderToProvider`) does NOT claim the order is `IN_PROGRESS` —
@@ -485,9 +502,9 @@ interface InternalFulfillmentResult {
  * the order's status history for admins, rather than silently no-op'ing
  * while claiming automated delivery started.
  */
-async function runInternalFulfillment(order: InstanceType<typeof Order>): Promise<InternalFulfillmentResult> {
+async function runInternalFulfillment(order: Order): Promise<InternalFulfillmentResult> {
   logger.warn(
-    { orderId: order._id.toString() },
+    { orderId: order.id },
     "[fulfillment] INTERNAL provider dispatch has no automation implemented — falling back to manual admin fulfillment"
   );
   return { automated: false };

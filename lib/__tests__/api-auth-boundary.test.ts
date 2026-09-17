@@ -34,7 +34,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
  * That ordering is exactly the property being tested — if any route were
  * refactored to move a DB call before its auth check, these tests would
  * start hanging or throwing on a real network attempt against a
- * non-existent test DB (there is deliberately no `MONGODB_URI` configured
+ * non-existent test DB (there is deliberately no `DATABASE_URL` configured
  * for this fast unit-test config — see vitest.config.mts), which would
  * itself be a useful regression signal.
  *
@@ -394,31 +394,27 @@ describe("Route-handler auth boundary — resource ownership", () => {
     mockAuth.mockResolvedValue(USER_SESSION);
 
     const otherUsersTicket = {
-      _id: "507f1f77bcf86cd799439099",
-      userId: { toString: () => "someone-else-entirely" },
+      id: "507f1f77bcf86cd799439099",
+      userId: "someone-else-entirely",
     };
 
-    // `connectDB()` and `SupportTicket.findById()` are both mocked here
-    // (rather than exercised for real) so this test isolates exactly the
+    // `prisma.supportTicket.findUnique()` is mocked here (rather than
+    // exercised for real) so this test isolates exactly the
     // ownership-check branch (`isOwner || role === "ADMIN"`) without
     // needing a real DB write — that transactional/data-layer behavior is
     // already covered by the DB-backed integration suite for the four
     // money-moving functions; this file's job is the auth/role/ownership
     // gate specifically. `vi.resetModules()` is required before this
-    // dynamic import because the route module (and its `@/lib/db` /
-    // `@/models/SupportTicket` imports) were already loaded — and cached
-    // by Node's ESM loader — by earlier tests in this same file, so a
-    // `vi.doMock` registered now would otherwise be ignored for an
-    // already-resolved module graph.
+    // dynamic import because the route module (and its `@/lib/db` import)
+    // were already loaded — and cached by Node's ESM loader — by earlier
+    // tests in this same file, so a `vi.doMock` registered now would
+    // otherwise be ignored for an already-resolved module graph.
     vi.resetModules();
-    vi.doMock("@/lib/db", () => ({ connectDB: vi.fn().mockResolvedValue(undefined) }));
-    vi.doMock("@/models/SupportTicket", () => ({
-      SupportTicket: {
-        findById: vi.fn().mockReturnValue({
-          populate: vi.fn().mockReturnValue({
-            lean: vi.fn().mockResolvedValue(otherUsersTicket),
-          }),
-        }),
+    vi.doMock("@/lib/db", () => ({
+      prisma: {
+        supportTicket: {
+          findUnique: vi.fn().mockResolvedValue(otherUsersTicket),
+        },
       },
     }));
     vi.doMock("@/auth", () => ({ auth: mockAuth }));
@@ -431,7 +427,6 @@ describe("Route-handler auth boundary — resource ownership", () => {
     expect(body.error).toMatch(/forbidden/i);
 
     vi.doUnmock("@/lib/db");
-    vi.doUnmock("@/models/SupportTicket");
     vi.doUnmock("@/auth");
     vi.resetModules();
   });
@@ -441,7 +436,7 @@ describe("Route-handler auth boundary — intentionally public / differently-aut
   it("GET /api/health never calls auth() (public liveness probe)", async () => {
     const { GET } = await import("@/app/api/health/route");
     // Don't actually invoke it (it calls the real connectDB() against no
-    // configured MONGODB_URI, which isn't this test's concern) — just
+    // configured DATABASE_URL, which isn't this test's concern) — just
     // confirm auth() was never called as a side effect of merely importing
     // and holding a reference to the handler.
     expect(typeof GET).toBe("function");
@@ -493,12 +488,14 @@ describe("Route-handler auth boundary — intentionally public / differently-aut
       // Unlike the rest of this file, `verifyCronSecret` reads `env.*`
       // (lib/env.ts's Zod-validated proxy) directly rather than going
       // through a mocked `@/auth`, and that proxy validates the ENTIRE
-      // schema on first access — so MONGODB_URI/AUTH_SECRET need throwaway
-      // placeholder values here (same pattern as the rate-limit block in
-      // lib/__tests__/auth-authorize.test.ts) purely to let validation
-      // succeed; CRON_SECRET itself stays unset/wrong per test below, and
-      // no real DB call ever happens because the auth check rejects first.
-      process.env.MONGODB_URI = "mongodb://localhost:27017/unit-test-placeholder";
+      // schema on first access — so DATABASE_URL/DIRECT_URL/AUTH_SECRET
+      // need throwaway placeholder values here (same pattern as the
+      // rate-limit block in lib/__tests__/auth-authorize.test.ts) purely
+      // to let validation succeed; CRON_SECRET itself stays unset/wrong
+      // per test below, and no real DB call ever happens because the auth
+      // check rejects first.
+      process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/unit-test-placeholder?schema=public";
+      process.env.DIRECT_URL = "postgresql://user:pass@localhost:5432/unit-test-placeholder?schema=public";
       process.env.AUTH_SECRET = "unit-test-placeholder-secret-not-a-real-secret-000";
     });
 

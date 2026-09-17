@@ -1,15 +1,13 @@
 import { getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { AccountSettingsPanel } from "@/components/dashboard/account-settings-panel";
 
 export default async function SettingsPage() {
   const session = await auth();
-  await connectDB();
   const t = await getTranslations("Dashboard.settings");
 
-  const user = await User.findById(session!.user.id).lean();
+  const user = await prisma.user.findUnique({ where: { id: session!.user.id } });
 
   return (
     <div className="mx-auto max-w-2xl">

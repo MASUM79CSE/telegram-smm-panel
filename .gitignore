@@ -73,3 +73,6 @@ next-env.d.ts
 # Internal working notes — never meant for the public repo (see README.md's
 # own note on this)
 MEMORY.md
+
+# Prisma generated client (generated code, not source)
+/lib/generated/prisma

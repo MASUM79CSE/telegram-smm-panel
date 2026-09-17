@@ -9,29 +9,29 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
  * in docs/PRODUCTION_READINESS.md: "no DB-backed integration or e2e
  * coverage" for the transactional order/deposit/refund service functions
  * (`lib/services/orders.ts`, `admin-payments.ts`, `admin-orders.ts`,
- * `refunds.ts`).
+ * `refunds.ts`), plus `lib/services/admin-bulk.ts` and `lib/services/jobs.ts`.
  *
- * Spins up a real, ephemeral MongoDB **replica set** per test file via
- * `mongodb-memory-server` (see `lib/__tests__/integration/setup.ts`) —
- * required because the functions under test use real multi-document
- * transactions, which only work on a replica set (exactly like the
- * MongoDB Atlas production target). Kept as a separate Vitest project
- * from the default `vitest.config.mts` because:
+ * Runs against a single real, locally-installed PostgreSQL database (see
+ * `lib/__tests__/integration/setup.ts` for the full provisioning
+ * instructions and safety guardrails — `DATABASE_URL`/`DIRECT_URL` must
+ * point at a database with "test" in its name, e.g.
+ * `telegram_panel_test`). This replaces the original MongoDB version's
+ * per-test-file ephemeral `mongodb-memory-server` replica set: Postgres has
+ * no equivalent lightweight embedded/in-memory server bundled with this
+ * project, and this sandbox has no Docker daemon available (ruling out
+ * testcontainers) — see MEMORY.md for the full rationale.
  *
- *  1. It needs a materially longer test timeout (replica-set startup +
- *     real transaction commits take real wall-clock time, unlike the
- *     pure-function unit suite).
- *  2. It should not silently slow down the fast, no-external-dependency
- *     unit-test loop developers run constantly during normal work.
+ * IMPORTANT difference from the old Mongo config: because every test file
+ * now shares ONE real database (rather than each getting its own disposable
+ * replica-set instance), `fileParallelism` is `false` here — running
+ * multiple integration test files concurrently against the same database
+ * would let one file's `beforeEach` `clearTestDb()` wipe rows another
+ * file's test is still asserting against. Tests remain reasonably fast
+ * despite running sequentially since each is a handful of real but small
+ * (single-digit-row) Postgres queries, not a multi-second replica-set boot.
  *
  * Run via `npm run test:integration` (or `npm run test:all` for both
- * suites). Requires network access on first run only, to download the
- * `mongodb-memory-server` binary into its local cache
- * (`node_modules/.cache/mongodb-memory-server/`) — already pre-warmed in
- * this environment; a fully offline CI runner should pre-cache it or use
- * the `MONGOMS_DOWNLOAD_MIRROR`/self-hosted binary options documented at
- * https://github.com/typegoose/mongodb-memory-server if network access
- * during CI is restricted.
+ * suites).
  */
 export default defineConfig({
   test: {
@@ -40,13 +40,12 @@ export default defineConfig({
     exclude: ["node_modules", ".next", ".ecc-vendor/**", ".claude/**"],
     testTimeout: 30_000,
     hookTimeout: 60_000,
-    // Integration tests share one real (in-memory) database connection per
-    // file via top-level `beforeAll`/`afterAll` — running files in
-    // parallel worker processes is fine (each file gets its OWN replica
-    // set instance), but tests WITHIN a file must run sequentially since
-    // they share that one connection and rely on `beforeEach` clearing
-    // state between them.
-    fileParallelism: true,
+    // All integration test files share ONE real Postgres database
+    // connection/instance (see header comment) — files must run
+    // sequentially, not in separate parallel workers, or one file's
+    // `clearTestDb()` could wipe rows a concurrently-running file's test
+    // is still asserting against.
+    fileParallelism: false,
     pool: "forks",
   },
   resolve: {

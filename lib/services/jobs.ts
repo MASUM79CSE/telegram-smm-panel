@@ -1,6 +1,4 @@
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
-import { Service } from "@/models/Service";
+import { connectDB, prisma } from "@/lib/db";
 import { dispatchOrderToProvider, pollOrderStatus } from "@/lib/fulfillment";
 import { logger } from "@/lib/logger";
 
@@ -81,29 +79,31 @@ function median(sorted: number[]): number {
  * orders stuck there due to a transient dispatch failure. See
  * `scripts/process-orders.ts`'s original doc comment for the full
  * rationale (in particular: deliberately does NOT filter on
- * `providerId: { $ne: null }` — see that file for why).
+ * `providerId: { not: null }` — see that file for why).
  */
 export async function runProcessOrdersJob(): Promise<JobRunResult> {
   await connectDB();
 
-  const candidates = await Order.find({
-    status: { $in: ["PENDING", "PROCESSING"] },
-    attempts: { $lt: PROCESS_ORDERS_MAX_ATTEMPTS },
-  })
-    .sort({ createdAt: 1 })
-    .limit(PROCESS_ORDERS_BATCH_SIZE)
-    .select("_id");
+  const candidates = await prisma.order.findMany({
+    where: {
+      status: { in: ["PENDING", "PROCESSING"] },
+      attempts: { lt: PROCESS_ORDERS_MAX_ATTEMPTS },
+    },
+    orderBy: { createdAt: "asc" },
+    take: PROCESS_ORDERS_BATCH_SIZE,
+    select: { id: true },
+  });
 
   let succeeded = 0;
   let failed = 0;
 
   for (const c of candidates) {
     try {
-      await dispatchOrderToProvider(c._id.toString());
+      await dispatchOrderToProvider(c.id);
       succeeded += 1;
     } catch (err) {
       failed += 1;
-      logger.error({ err, orderId: c._id.toString() }, "[jobs/process-orders] Failed to dispatch order");
+      logger.error({ err, orderId: c.id }, "[jobs/process-orders] Failed to dispatch order");
     }
   }
 
@@ -121,26 +121,31 @@ export async function runPollOrderStatusJob(): Promise<JobRunResult> {
 
   const cutoff = new Date(Date.now() - POLL_STATUS_MIN_RECHECK_INTERVAL_MS);
 
-  const candidates = await Order.find({
-    status: "IN_PROGRESS",
-    providerId: { $ne: null },
-    providerOrderId: { $ne: null },
-    $or: [{ lastStatusCheckAt: null }, { lastStatusCheckAt: { $lt: cutoff } }],
-  })
-    .sort({ lastStatusCheckAt: 1 }) // never-checked (null sorts first) and longest-stale first
-    .limit(POLL_STATUS_BATCH_SIZE)
-    .select("_id");
+  const candidates = await prisma.order.findMany({
+    where: {
+      status: "IN_PROGRESS",
+      providerId: { not: null },
+      providerOrderId: { not: null },
+      OR: [{ lastStatusCheckAt: null }, { lastStatusCheckAt: { lt: cutoff } }],
+    },
+    // Postgres sorts NULLs last by default in ascending order, unlike
+    // MongoDB (which sorts them first) — `nulls: "first"` restores the
+    // original "never-checked orders first, then longest-stale" ordering.
+    orderBy: { lastStatusCheckAt: { sort: "asc", nulls: "first" } },
+    take: POLL_STATUS_BATCH_SIZE,
+    select: { id: true },
+  });
 
   let succeeded = 0;
   let failed = 0;
 
   for (const c of candidates) {
     try {
-      await pollOrderStatus(c._id.toString());
+      await pollOrderStatus(c.id);
       succeeded += 1;
     } catch (err) {
       failed += 1;
-      logger.error({ err, orderId: c._id.toString() }, "[jobs/poll-order-status] Failed to poll order status");
+      logger.error({ err, orderId: c.id }, "[jobs/poll-order-status] Failed to poll order status");
     }
   }
 
@@ -157,21 +162,23 @@ export async function runPollOrderStatusJob(): Promise<JobRunResult> {
 export async function runComputeDeliveryEstimatesJob(): Promise<JobRunResult> {
   await connectDB();
 
-  const services = await Service.find().select("_id");
+  const services = await prisma.service.findMany({ select: { id: true } });
 
   let succeeded = 0;
   let failed = 0;
 
   for (const service of services) {
     try {
-      const completedOrders = await Order.find({
-        serviceId: service._id,
-        status: "COMPLETED",
-        completedAt: { $ne: null },
-      })
-        .sort({ completedAt: -1 })
-        .limit(DELIVERY_ESTIMATE_SAMPLE_SIZE)
-        .select("createdAt completedAt");
+      const completedOrders = await prisma.order.findMany({
+        where: {
+          serviceId: service.id,
+          status: "COMPLETED",
+          completedAt: { not: null },
+        },
+        orderBy: { completedAt: "desc" },
+        take: DELIVERY_ESTIMATE_SAMPLE_SIZE,
+        select: { createdAt: true, completedAt: true },
+      });
 
       if (completedOrders.length === 0) continue;
 
@@ -184,12 +191,12 @@ export async function runComputeDeliveryEstimatesJob(): Promise<JobRunResult> {
 
       const estimate = Math.round(median(minutesSamples));
 
-      await Service.updateOne({ _id: service._id }, { $set: { estimatedDeliveryMinutes: estimate } });
+      await prisma.service.update({ where: { id: service.id }, data: { estimatedDeliveryMinutes: estimate } });
       succeeded += 1;
     } catch (err) {
       failed += 1;
       logger.error(
-        { err, serviceId: service._id.toString() },
+        { err, serviceId: service.id },
         "[jobs/compute-delivery-estimates] Failed to compute estimate for service"
       );
     }
@@ -234,12 +241,11 @@ export async function checkQueueDepth(): Promise<QueueDepthCheckResult> {
   const staleCutoff = new Date(Date.now() - STALE_PROCESSING_MINUTES * 60 * 1000);
 
   const [staleProcessingCount, pendingBacklogCount] = await Promise.all([
-    Order.countDocuments({ status: "PROCESSING", updatedAt: { $lt: staleCutoff } }),
-    Order.countDocuments({ status: "PENDING" }),
+    prisma.order.count({ where: { status: "PROCESSING", updatedAt: { lt: staleCutoff } } }),
+    prisma.order.count({ where: { status: "PENDING" } }),
   ]);
 
-  const alert =
-    staleProcessingCount > 0 || pendingBacklogCount > PENDING_BACKLOG_ALERT_THRESHOLD;
+  const alert = staleProcessingCount > 0 || pendingBacklogCount > PENDING_BACKLOG_ALERT_THRESHOLD;
 
   if (alert) {
     logger.error(

@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 
 export async function GET(
   request: Request,
@@ -12,15 +11,22 @@ export async function GET(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await connectDB();
   const { id } = await params;
 
-  const ticket = await SupportTicket.findById(id).populate("messages.senderId", "name role").lean();
+  const ticket = await prisma.supportTicket.findUnique({
+    where: { id },
+    include: {
+      messages: {
+        orderBy: { createdAt: "asc" },
+        include: { sender: { select: { name: true, role: true } } },
+      },
+    },
+  });
   if (!ticket) {
     return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
   }
 
-  const isOwner = ticket.userId.toString() === session.user.id;
+  const isOwner = ticket.userId === session.user.id;
   if (!isOwner && session.user.role !== "ADMIN") {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }

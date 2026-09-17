@@ -1,8 +1,7 @@
 import { notFound } from "next/navigation";
 import { getLocale, getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 import { redirect } from "@/i18n/navigation";
 import { TicketReplyForm } from "@/components/support/ticket-reply-form";
 import { StatusBadge } from "@/components/dashboard/status-badge";
@@ -15,14 +14,21 @@ export default async function TicketPage({ params }: { params: Promise<{ id: str
   const tPriority = await getTranslations("TicketPriority");
   if (!session?.user?.id) return redirect({ href: "/login", locale });
 
-  await connectDB();
   const { id } = await params;
 
-  const ticket = await SupportTicket.findById(id).populate("messages.senderId", "name role").lean();
+  const ticket = await prisma.supportTicket.findUnique({
+    where: { id },
+    include: {
+      messages: {
+        orderBy: { createdAt: "asc" },
+        include: { sender: { select: { name: true, role: true } } },
+      },
+    },
+  });
 
   if (!ticket) notFound();
 
-  if (ticket.userId.toString() !== session.user.id && session.user.role !== "ADMIN") {
+  if (ticket.userId !== session.user.id && session.user.role !== "ADMIN") {
     return redirect({ href: "/dashboard/support", locale });
   }
 
@@ -31,7 +37,7 @@ export default async function TicketPage({ params }: { params: Promise<{ id: str
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-white">{ticket.subject}</h1>
         <div className="mt-2 flex items-center gap-3 text-sm text-slate-400">
-          <span>#{ticket._id.toString().slice(-8)}</span>
+          <span>#{ticket.id.slice(-8)}</span>
           <StatusBadge status={ticket.status} label={tStatus(ticket.status)} />
           <span>{t("priority", { priority: tPriority(ticket.priority) })}</span>
         </div>
@@ -40,16 +46,14 @@ export default async function TicketPage({ params }: { params: Promise<{ id: str
       <div className="space-y-4">
         {ticket.messages.map((message) => (
           <div
-            key={message._id?.toString()}
+            key={message.id}
             className={`rounded-xl border p-5 ${
               message.isAdmin ? "border-blue-900 bg-blue-950/30" : "border-slate-800 bg-slate-950"
             }`}
           >
             <div className="mb-3 flex items-center justify-between">
               <p className="text-sm font-medium text-white">
-                {message.isAdmin
-                  ? t("supportTeam")
-                  : (message.senderId as unknown as { name?: string })?.name || t("defaultUser")}
+                {message.isAdmin ? t("supportTeam") : message.sender?.name || t("defaultUser")}
               </p>
               <p className="text-xs text-slate-500">{new Date(message.createdAt).toLocaleString()}</p>
             </div>
@@ -60,7 +64,7 @@ export default async function TicketPage({ params }: { params: Promise<{ id: str
 
       {ticket.status !== "CLOSED" && (
         <div className="mt-6">
-          <TicketReplyForm ticketId={ticket._id.toString()} />
+          <TicketReplyForm ticketId={ticket.id} />
         </div>
       )}
     </div>

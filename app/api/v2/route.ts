@@ -1,9 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
-import { Wallet } from "@/models/Wallet";
-import { Order } from "@/models/Order";
+import { prisma } from "@/lib/db";
 import { apiV2RequestSchema } from "@/lib/validation";
 import { rateLimit } from "@/lib/rate-limit";
 import { resolveApiKey } from "@/lib/services/api-keys";
@@ -61,8 +58,6 @@ function errorResponse(message: string) {
 }
 
 export async function POST(request: Request) {
-  await connectDB();
-
   // Accept JSON, form-encoded, or multipart bodies — real reseller
   // integrations (PHP curl, Python requests) commonly POST
   // application/x-www-form-urlencoded, not JSON, matching the reference
@@ -92,7 +87,7 @@ export async function POST(request: Request) {
   let apiKeyUserId: string;
   try {
     const apiKey = await resolveApiKey(rawKey);
-    apiKeyUserId = apiKey.userId.toString();
+    apiKeyUserId = apiKey.userId;
   } catch {
     return errorResponse("Invalid API key.");
   }
@@ -102,7 +97,7 @@ export async function POST(request: Request) {
     return errorResponse("Rate limit exceeded. Please slow down your requests.");
   }
 
-  const user = await User.findById(apiKeyUserId).select("status");
+  const user = await prisma.user.findUnique({ where: { id: apiKeyUserId }, select: { status: true } });
   if (!user || user.status !== "ACTIVE") {
     return errorResponse("Account is not active.");
   }
@@ -145,7 +140,7 @@ async function handleServices() {
 }
 
 async function handleBalance(userId: string) {
-  const wallet = await Wallet.findOne({ userId });
+  const wallet = await prisma.wallet.findUnique({ where: { userId } });
   if (!wallet) return errorResponse("Wallet not found.");
 
   return NextResponse.json({
@@ -179,7 +174,7 @@ async function handleAdd(
       quantity: quantityNum,
     });
 
-    return NextResponse.json({ order: order._id.toString() });
+    return NextResponse.json({ order: order.id });
   } catch (err) {
     if (err instanceof AppError) {
       return errorResponse(err.message);
@@ -191,9 +186,10 @@ async function handleAdd(
 
 /** Real per-order status payload, or `{ error }` for one that doesn't exist / isn't this key's. */
 async function statusPayloadFor(userId: string, orderId: string) {
-  const order = await Order.findOne({ _id: orderId, userId }).select(
-    "charge startCount remains status"
-  );
+  const order = await prisma.order.findFirst({
+    where: { id: orderId, userId },
+    select: { charge: true, startCount: true, remains: true, status: true },
+  });
 
   if (!order) return { error: "Incorrect order ID" };
 
@@ -253,7 +249,7 @@ async function handleCancel(userId: string, params: { order?: string | number; o
 
   const results = await Promise.all(
     ids.map(async (id) => {
-      const existing = await Order.findOne({ _id: id, userId }).select("status");
+      const existing = await prisma.order.findFirst({ where: { id, userId }, select: { status: true } });
       if (!existing) return { order: id, cancel: { error: "Incorrect order ID" } };
 
       if (!["PENDING", "PROCESSING"].includes(existing.status)) {

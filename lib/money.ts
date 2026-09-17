@@ -1,66 +1,62 @@
-import { Decimal128 } from "mongodb";
+import { Prisma } from "@/lib/generated/prisma";
 
 /**
- * Helpers to safely work with Mongo's Decimal128 for money math without
- * ever dropping into floating point (which caused real bugs in the original
- * plan's Prisma `Decimal` usage too — the same discipline applies here).
+ * Helpers to safely work with money fields without ever dropping into
+ * native floating-point arithmetic.
  *
- * We use decimal.js-style string arithmetic via BigInt on a fixed scale
- * (4 decimal places) to avoid pulling in another dependency for now.
+ * This is the Postgres/Prisma-era rewrite of the original MongoDB version
+ * of this file, which manually reimplemented fixed-point arithmetic via
+ * BigInt because `mongodb`'s `Decimal128` type has no arithmetic methods of
+ * its own. Prisma's `Decimal` type (re-exported here as `Prisma.Decimal`)
+ * is actually decimal.js under the hood, which already has correct,
+ * battle-tested arbitrary-precision decimal arithmetic built in — so this
+ * version is a thin, intent-revealing wrapper around decimal.js's own
+ * methods rather than a manual reimplementation. The public API of this
+ * file (function names/signatures) is kept identical to the original so
+ * every call site elsewhere in this codebase needed no changes beyond the
+ * import already being updated by the wider migration.
  */
-const SCALE = 4; // matches original plan's Decimal(12,4) for service rates
-const SCALE_FACTOR = 10 ** SCALE;
+const SCALE = 4; // matches the original convention: Decimal(18, 4) columns
 
-export function toDecimal128(value: number | string): Decimal128 {
+export type Money = Prisma.Decimal;
+
+export function toDecimal128(value: number | string | Money): Money {
+  if (value instanceof Prisma.Decimal) return value.toDecimalPlaces(SCALE);
   const num = typeof value === "string" ? parseFloat(value) : value;
   if (!Number.isFinite(num)) throw new Error("Invalid numeric value for money field");
-  return Decimal128.fromString(num.toFixed(SCALE));
+  return new Prisma.Decimal(num.toFixed(SCALE));
 }
 
-export function decimalToNumber(value: Decimal128 | number | string | null | undefined): number {
+export function decimalToNumber(value: Money | number | string | null | undefined): number {
   if (value === null || value === undefined) return 0;
   if (typeof value === "number") return value;
-  return parseFloat(value.toString());
+  if (typeof value === "string") return parseFloat(value);
+  return value.toNumber();
 }
 
-function toFixedInt(value: Decimal128 | number | string): bigint {
-  const n = decimalToNumber(value);
-  return BigInt(Math.round(n * SCALE_FACTOR));
+export function addMoney(a: Money | number | string, b: Money | number | string): Money {
+  return toDecimal128(a).plus(toDecimal128(b)).toDecimalPlaces(SCALE);
 }
 
-function fromFixedInt(v: bigint): Decimal128 {
-  const sign = v < 0n ? "-" : "";
-  const abs = v < 0n ? -v : v;
-  const str = abs.toString().padStart(SCALE + 1, "0");
-  const intPart = str.slice(0, -SCALE) || "0";
-  const fracPart = str.slice(-SCALE);
-  return Decimal128.fromString(`${sign}${intPart}.${fracPart}`);
+export function subtractMoney(a: Money | number | string, b: Money | number | string): Money {
+  return toDecimal128(a).minus(toDecimal128(b)).toDecimalPlaces(SCALE);
 }
 
-export function addMoney(a: Decimal128 | number | string, b: Decimal128 | number | string): Decimal128 {
-  return fromFixedInt(toFixedInt(a) + toFixedInt(b));
+export function isGreaterOrEqual(a: Money | number | string, b: Money | number | string): boolean {
+  return toDecimal128(a).greaterThanOrEqualTo(toDecimal128(b));
 }
 
-export function subtractMoney(a: Decimal128 | number | string, b: Decimal128 | number | string): Decimal128 {
-  return fromFixedInt(toFixedInt(a) - toFixedInt(b));
-}
-
-export function isGreaterOrEqual(a: Decimal128 | number | string, b: Decimal128 | number | string): boolean {
-  return toFixedInt(a) >= toFixedInt(b);
-}
-
-export function isPositive(a: Decimal128 | number | string): boolean {
-  return toFixedInt(a) > 0n;
+export function isPositive(a: Money | number | string): boolean {
+  return toDecimal128(a).greaterThan(0);
 }
 
 /** Compute order charge = (rate per 1000) * quantity / 1000, rounded to 4dp. */
-export function calculateCharge(ratePer1000: Decimal128 | number | string, quantity: number): Decimal128 {
-  const rate = decimalToNumber(ratePer1000);
-  const charge = (rate * quantity) / 1000;
-  return toDecimal128(charge);
+export function calculateCharge(ratePer1000: Money | number | string, quantity: number): Money {
+  const rate = toDecimal128(ratePer1000);
+  return rate.times(quantity).dividedBy(1000).toDecimalPlaces(SCALE);
 }
 
-export function formatMoney(value: Decimal128 | number | string, currency = "USD"): string {
+export function formatMoney(value: Money | number | string, currency = "USD"): string {
   const n = decimalToNumber(value);
   return new Intl.NumberFormat("en-US", { style: "currency", currency, currencyDisplay: "narrowSymbol" }).format(n);
 }

@@ -1,10 +1,9 @@
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { OrdersTable } from "@/components/admin/orders-table";
 import { AdminFilterBar } from "@/components/admin/admin-filter-bar";
 import { AdminPagination } from "@/components/admin/admin-pagination";
-import { parseListQuery, escapeRegExp } from "@/lib/admin-query";
+import { parseListQuery } from "@/lib/admin-query";
+import type { Prisma, OrderStatus } from "@/lib/generated/prisma";
 
 const ORDER_STATUS_OPTIONS = [
   "PENDING",
@@ -22,59 +21,57 @@ export default async function AdminOrdersPage({
 }: {
   searchParams: Promise<Record<string, string | undefined>>;
 }) {
-  await connectDB();
-
   const resolvedSearchParams = await searchParams;
   const urlSearchParams = new URLSearchParams(
     Object.entries(resolvedSearchParams).filter(([, v]) => v !== undefined) as [string, string][]
   );
   const { page, limit, status, search, dateRange } = parseListQuery(urlSearchParams);
 
-  const filter: Record<string, unknown> = {};
-  if (status && status.length > 0) filter.status = { $in: status };
-  if (dateRange) filter.createdAt = dateRange;
+  const where: Prisma.OrderWhereInput = {};
+  if (status && status.length > 0) where.status = { in: status as OrderStatus[] };
+  if (dateRange) where.createdAt = dateRange;
 
   if (search) {
-    const re = { $regex: escapeRegExp(search), $options: "i" };
-    const matchingUsers = await User.find({ $or: [{ name: re }, { email: re }] })
-      .select("_id")
-      .lean();
-    filter.$or = [{ target: re }, { userId: { $in: matchingUsers.map((u) => u._id) } }];
+    where.OR = [
+      { target: { contains: search, mode: "insensitive" } },
+      {
+        user: {
+          is: {
+            OR: [
+              { name: { contains: search, mode: "insensitive" } },
+              { email: { contains: search, mode: "insensitive" } },
+            ],
+          },
+        },
+      },
+    ];
   }
 
   const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .populate("userId", "name email")
-      .populate("serviceId", "name")
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    Order.countDocuments(filter),
+    prisma.order.findMany({
+      where,
+      include: {
+        user: { select: { name: true, email: true } },
+        service: { select: { name: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.order.count({ where }),
   ]);
 
-  const rows = orders.map((o) => {
-    // `.lean()` still leaves populated sub-documents as Mongoose-ish
-    // objects (their `_id` is a real `ObjectId`, which has a `toJSON`
-    // method) — passing those straight into a Client Component prop trips
-    // React's "Only plain objects can be passed to Client Components"
-    // dev-mode warning. Pluck only the plain, already-serializable fields
-    // the table actually renders instead of forwarding the populated doc
-    // as-is.
-    const user = o.userId as unknown as { name?: string; email?: string } | null;
-    const service = o.serviceId as unknown as { name?: string } | null;
-    return {
-      _id: o._id.toString(),
-      target: o.target,
-      quantity: o.quantity,
-      charge: o.charge.toString(),
-      status: o.status,
-      refillStatus: o.refillStatus,
-      createdAt: o.createdAt.toISOString(),
-      userId: user ? { name: user.name, email: user.email } : null,
-      serviceId: service ? { name: service.name } : null,
-    };
-  });
+  const rows = orders.map((o) => ({
+    _id: o.id,
+    target: o.target,
+    quantity: o.quantity,
+    charge: o.charge.toString(),
+    status: o.status,
+    refillStatus: o.refillStatus,
+    createdAt: o.createdAt.toISOString(),
+    userId: o.user ? { name: o.user.name, email: o.user.email } : null,
+    serviceId: o.service ? { name: o.service.name } : null,
+  }));
 
   const totalPages = Math.max(1, Math.ceil(total / limit));
 

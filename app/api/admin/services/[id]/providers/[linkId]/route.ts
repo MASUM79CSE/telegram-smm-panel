@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ServiceProvider } from "@/models/ServiceProvider";
+import { prisma } from "@/lib/db";
 import { serviceProviderSchema } from "@/lib/validation";
 import { toDecimal128 } from "@/lib/money";
 import { recordAudit } from "@/lib/audit";
@@ -15,7 +14,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id: serviceId, linkId } = await params;
 
   const body = await request.json();
@@ -36,12 +34,11 @@ export async function PATCH(
   delete update.serviceId;
   delete update.providerId;
 
-  const link = await ServiceProvider.findOneAndUpdate({ _id: linkId, serviceId }, update, {
-    returnDocument: "after",
-  });
-  if (!link) {
+  const existing = await prisma.serviceProvider.findFirst({ where: { id: linkId, serviceId } });
+  if (!existing) {
     return NextResponse.json({ error: "Provider link not found" }, { status: 404 });
   }
+  const link = await prisma.serviceProvider.update({ where: { id: linkId }, data: update });
 
   await recordAudit({
     actorId: session.user.id,
@@ -64,13 +61,13 @@ export async function DELETE(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id: serviceId, linkId } = await params;
 
-  const link = await ServiceProvider.findOneAndDelete({ _id: linkId, serviceId });
-  if (!link) {
+  const existing = await prisma.serviceProvider.findFirst({ where: { id: linkId, serviceId } });
+  if (!existing) {
     return NextResponse.json({ error: "Provider link not found" }, { status: 404 });
   }
+  const link = await prisma.serviceProvider.delete({ where: { id: linkId } });
 
   await recordAudit({
     actorId: session.user.id,

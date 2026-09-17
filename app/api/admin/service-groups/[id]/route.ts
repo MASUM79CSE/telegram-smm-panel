@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ServiceGroup } from "@/models/ServiceGroup";
-import { Category } from "@/models/Category";
+import { prisma } from "@/lib/db";
 import { serviceGroupSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -15,7 +13,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -24,7 +21,7 @@ export async function PATCH(
     return NextResponse.json({ error: "Invalid data", details: parsed.error.flatten().fieldErrors }, { status: 400 });
   }
 
-  const group = await ServiceGroup.findByIdAndUpdate(id, parsed.data, { returnDocument: "after" });
+  const group = await prisma.serviceGroup.update({ where: { id }, data: parsed.data }).catch(() => null);
   if (!group) {
     return NextResponse.json({ error: "Service group not found" }, { status: 404 });
   }
@@ -50,10 +47,9 @@ export async function DELETE(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
-  const categoryCount = await Category.countDocuments({ groupId: id });
+  const categoryCount = await prisma.category.count({ where: { groupId: id } });
   if (categoryCount > 0) {
     return NextResponse.json(
       {
@@ -65,7 +61,7 @@ export async function DELETE(
     );
   }
 
-  const group = await ServiceGroup.findByIdAndDelete(id);
+  const group = await prisma.serviceGroup.delete({ where: { id } }).catch(() => null);
   if (!group) {
     return NextResponse.json({ error: "Service group not found" }, { status: 404 });
   }

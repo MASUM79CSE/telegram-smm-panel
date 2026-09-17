@@ -1,8 +1,6 @@
 import { getLocale, getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Wallet } from "@/models/Wallet";
-import { Order } from "@/models/Order";
+import { prisma } from "@/lib/db";
 import { getDisplayMoney, getDisplayMoneyBatch } from "@/lib/services/display-money";
 import { getUserSpendingSeries } from "@/lib/services/analytics";
 import { DualCurrency } from "@/components/shared/dual-currency";
@@ -14,19 +12,19 @@ import { Wallet as WalletIcon, ShoppingCart, Package, Plus } from "lucide-react"
 export default async function DashboardPage() {
   const session = await auth();
   const locale = await getLocale();
-  await connectDB();
   const t = await getTranslations("Dashboard.home");
   const tStatus = await getTranslations("StatusBadge");
 
   const [wallet, totalOrders, pendingOrders, recentOrders, spending] = await Promise.all([
-    Wallet.findOne({ userId: session!.user.id }).lean(),
-    Order.countDocuments({ userId: session!.user.id }),
-    Order.countDocuments({ userId: session!.user.id, status: { $in: ["PENDING", "PROCESSING", "IN_PROGRESS"] } }),
-    Order.find({ userId: session!.user.id })
-      .populate("serviceId", "name")
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .lean(),
+    prisma.wallet.findUnique({ where: { userId: session!.user.id } }),
+    prisma.order.count({ where: { userId: session!.user.id } }),
+    prisma.order.count({ where: { userId: session!.user.id, status: { in: ["PENDING", "PROCESSING", "IN_PROGRESS"] } } }),
+    prisma.order.findMany({
+      where: { userId: session!.user.id },
+      include: { service: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+    }),
     getUserSpendingSeries(session!.user.id, 30),
   ]);
 
@@ -93,12 +91,11 @@ export default async function DashboardPage() {
           ) : (
             <ul className="space-y-3">
               {recentOrders.map((order, i) => {
-                const service = order.serviceId as unknown as { name?: string } | null;
                 const charge = recentCharges[i];
                 return (
-                  <li key={order._id.toString()} className="flex items-center justify-between gap-3 text-sm">
+                  <li key={order.id} className="flex items-center justify-between gap-3 text-sm">
                     <div className="min-w-0">
-                      <p className="truncate text-slate-200">{service?.name ?? t("unknownService")}</p>
+                      <p className="truncate text-slate-200">{order.service?.name ?? t("unknownService")}</p>
                       <p className="text-xs text-slate-500">{new Date(order.createdAt).toLocaleDateString()}</p>
                     </div>
                     <div className="flex shrink-0 items-center gap-3">

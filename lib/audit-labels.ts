@@ -1,4 +1,4 @@
-import type { AuditAction } from "@/models/AuditLog";
+import type { AuditAction } from "@/lib/generated/prisma";
 
 /**
  * Human-readable label + category for each `AuditAction`, shared by the

@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
+import { prisma } from "@/lib/db";
 import { orderSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { placeOrder } from "@/lib/services/orders";
@@ -19,20 +18,19 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    await connectDB();
-
     const { searchParams } = new URL(request.url);
     const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10));
     const limit = Math.min(50, Math.max(1, parseInt(searchParams.get("limit") || "20", 10)));
 
     const [orders, total] = await Promise.all([
-      Order.find({ userId: session.user.id })
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .populate("serviceId", "name")
-        .lean(),
-      Order.countDocuments({ userId: session.user.id }),
+      prisma.order.findMany({
+        where: { userId: session.user.id },
+        orderBy: { createdAt: "desc" },
+        skip: (page - 1) * limit,
+        take: limit,
+        include: { service: { select: { name: true } } },
+      }),
+      prisma.order.count({ where: { userId: session.user.id } }),
     ]);
 
     return NextResponse.json({ orders, total, page, limit });
@@ -55,8 +53,6 @@ export async function POST(request: Request) {
     if (!success) {
       return NextResponse.json({ error: "Too many orders placed. Please slow down." }, { status: 429 });
     }
-
-    await connectDB();
 
     const body = await request.json();
     const parsed = orderSchema.safeParse(body);

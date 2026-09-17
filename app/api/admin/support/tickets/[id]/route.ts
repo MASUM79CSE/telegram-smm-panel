@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 
 const schema = z.object({ status: z.enum(["OPEN", "ANSWERED", "CLOSED"]) });
 
@@ -15,7 +14,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -24,7 +22,9 @@ export async function PATCH(
     return NextResponse.json({ error: "Invalid status" }, { status: 400 });
   }
 
-  const ticket = await SupportTicket.findByIdAndUpdate(id, { status: parsed.data.status }, { returnDocument: "after" });
+  const ticket = await prisma.supportTicket
+    .update({ where: { id }, data: { status: parsed.data.status } })
+    .catch(() => null);
   if (!ticket) {
     return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
   }

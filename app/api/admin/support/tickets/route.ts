@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
-import { User } from "@/models/User";
-import { parseListQuery, escapeRegExp } from "@/lib/admin-query";
+import { prisma } from "@/lib/db";
+import type { Prisma, TicketStatus } from "@/lib/generated/prisma";
+import { parseListQuery } from "@/lib/admin-query";
 
 export async function GET(request: Request) {
   const session = await auth();
@@ -11,32 +10,35 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const { searchParams } = new URL(request.url);
   const { page, limit, status, search, dateRange } = parseListQuery(searchParams, 20, 100);
 
-  const filter: Record<string, unknown> = {};
-  if (status && status.length > 0) filter.status = { $in: status };
-  if (dateRange) filter.createdAt = dateRange;
+  const where: Prisma.SupportTicketWhereInput = {};
+  if (status && status.length > 0) where.status = { in: status as TicketStatus[] };
+  if (dateRange) where.createdAt = dateRange;
 
   if (search) {
-    const re = { $regex: escapeRegExp(search), $options: "i" };
-    const matchingUsers = await User.find({ $or: [{ name: re }, { email: re }] })
-      .select("_id")
-      .lean();
-    filter.$or = [{ subject: re }, { userId: { $in: matchingUsers.map((u) => u._id) } }];
+    const matchingUsers = await prisma.user.findMany({
+      where: {
+        OR: [{ name: { contains: search, mode: "insensitive" } }, { email: { contains: search, mode: "insensitive" } }],
+      },
+      select: { id: true },
+    });
+    where.OR = [
+      { subject: { contains: search, mode: "insensitive" } },
+      { userId: { in: matchingUsers.map((u) => u.id) } },
+    ];
   }
 
   const [tickets, total] = await Promise.all([
-    SupportTicket.find(filter)
-      .select("-messages")
-      .populate("userId", "name email")
-      .sort({ updatedAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    SupportTicket.countDocuments(filter),
+    prisma.supportTicket.findMany({
+      where,
+      include: { user: { select: { name: true, email: true } } },
+      orderBy: { updatedAt: "desc" },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.supportTicket.count({ where }),
   ]);
 
   return NextResponse.json({ tickets, total, page, limit });

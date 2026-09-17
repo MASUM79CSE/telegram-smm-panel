@@ -1,15 +1,10 @@
-import { MongoMemoryReplSet } from "mongodb-memory-server";
-import mongoose from "mongoose";
 import { hash } from "bcryptjs";
 import { writeFileSync, openSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { spawn, type ChildProcess } from "child_process";
-import { User } from "../models/User";
-import { Wallet } from "../models/Wallet";
-import { getSettings } from "../models/Settings";
-import { Category } from "../models/Category";
-import { Service } from "../models/Service";
+import { PrismaClient } from "../lib/generated/prisma";
+import { toDecimal128 } from "../lib/money";
 
 /**
  * Playwright global setup for the end-to-end smoke suite
@@ -19,16 +14,23 @@ import { Service } from "../models/Service";
  *
  * Design decisions (documented, not accidental):
  *
- * 1. **A real, ephemeral MongoDB replica set** (`mongodb-memory-server`,
- *    same tool + same 1-node-replSet-with-wiredTiger shape already used by
- *    `lib/__tests__/integration/setup.ts` and `scripts/start-dev-db.ts`) —
- *    NOT the shared Atlas dev database this project's `.env.local` points
- *    at. Running e2e tests against a real dev database would be
- *    destructive (registers real accounts, submits real deposits) and
- *    non-repeatable (results would depend on whatever data already exists
- *    there). A replica set (not a standalone `mongod`) is required because
- *    order placement/deposit approval use
- *    `mongoose.startSession().withTransaction()`.
+ * 1. **A real, dedicated local PostgreSQL database** — NOT the shared
+ *    Supabase dev database this project's `.env.local` might point at.
+ *    Running e2e tests against a real dev database would be destructive
+ *    (registers real accounts, submits real deposits) and non-repeatable
+ *    (results would depend on whatever data already exists there).
+ *    Postgres/Prisma migration note: the original MongoDB version of this
+ *    file spun up a fully disposable, ephemeral `mongodb-memory-server`
+ *    replica set per run. There is no equivalent bundled in-memory/
+ *    embedded Postgres server for Node, and this sandbox has no Docker
+ *    daemon available (ruling out testcontainers) — see
+ *    `lib/__tests__/integration/setup.ts`'s header comment for the same
+ *    constraint already documented for the integration suite. So this
+ *    file instead connects to (and `clearTestDb()`-style wipes, then
+ *    reseeds) a real, already-running local Postgres database whose URL
+ *    is given via `E2E_DATABASE_URL` — see this file's own guardrail below
+ *    requiring "test"/"e2e" in that URL, to make it structurally hard to
+ *    ever point this at a real database by mistake.
  *
  * 2. **Runs the real, already-built production server** (`next start`)
  *    rather than `next dev` — this is an end-to-end smoke test of what
@@ -45,18 +47,18 @@ import { Service } from "../models/Service";
  *    `[clearOutputDirs, ...pluginSetupTasks, ...globalTeardowns, ...globalSetups]`.
  *    `webServer` is implemented as a plugin, so its process is spawned
  *    during `pluginSetupTasks` — BEFORE any `globalSetups` entry (i.e.
- *    this file) ever runs. That means `MONGODB_URI`, `PORT`, and every
+ *    this file) ever runs. That means `DATABASE_URL`, `PORT`, and every
  *    other `process.env` mutation this file makes would still be `undefined`
  *    to a Playwright-managed `webServer` process (verified empirically: a
  *    minimal repro config showed `webServer`'s command sees
  *    `FOO=undefined` when `FOO` is set inside `globalSetup`, but sees it
  *    correctly when set at the top of `playwright.config.ts`'s module
- *    body instead — which isn't usable here either, since creating the
- *    in-memory Mongo replica set is inherently asynchronous and
- *    `playwright.config.ts` is evaluated synchronously). Spawning the
- *    server ourselves, after the DB is ready and env vars are computed,
- *    sidesteps the ordering problem entirely. `globalTeardown` (the
- *    function this file returns) kills that same child process.
+ *    body instead — which isn't usable here either, since seeding requires
+ *    an asynchronous DB round-trip and `playwright.config.ts` is evaluated
+ *    synchronously). Spawning the server ourselves, after the DB is ready
+ *    and env vars are computed, sidesteps the ordering problem entirely.
+ *    `globalTeardown` (the function this file returns) kills that same
+ *    child process.
  *
  * 4. **A throwaway `AUTH_SECRET` and `ALLOWED_ORIGINS=http://localhost:3100`
  *    are set here too** (not reused from `.env.local`) so this suite never
@@ -66,7 +68,7 @@ import { Service } from "../models/Service";
  *    headers, which must be on the allow-list or every mutating fetch()
  *    call the UI makes would get a 403).
  *
- * 5. **One admin + platform settings are seeded directly via Mongoose**
+ * 5. **One admin + platform settings are seeded directly via Prisma**
  *    (bypassing HTTP, the same way `scripts/seed.ts` does for real
  *    deployments) so the suite doesn't waste time/fragility on seeding
  *    through the UI — the register/login FLOW itself is exactly what the
@@ -84,7 +86,7 @@ import { Service } from "../models/Service";
  *    this suite needing a real mailbox.
  */
 
-let replSet: MongoMemoryReplSet | undefined;
+let seedClient: PrismaClient | undefined;
 let serverProcess: ChildProcess | undefined;
 let teardownRequested = false;
 
@@ -109,40 +111,67 @@ function waitForServerReady(url: string, timeoutMs: number): Promise<void> {
 }
 
 export default async function globalSetup(): Promise<() => Promise<void>> {
-  replSet = await MongoMemoryReplSet.create({
-    replSet: { count: 1, storageEngine: "wiredTiger" },
-  });
-  // Bake the database name into the URI itself (rather than passing a
-  // separate `{ dbName: "e2e" }` connect option below) because
-  // `lib/db.ts#connectDB()` — used by the real `next start` server this
-  // file spawns — connects with the bare `MONGODB_URI` env var and no
-  // `dbName` option. `replSet.getUri()` with no argument produces a URI
-  // with no database name in its path, which makes Mongoose default to
-  // database "test"; if this file's own seeding connection then used a
-  // `dbName` option to target "e2e" instead, the seeded data and the
-  // server's queries would silently point at two different databases on
-  // the same replica set (confirmed by reproducing exactly this: the
-  // server logs `CredentialsSignin` for the seeded admin/funded-customer
-  // accounts because it can't find them in "test"). Using the same
-  // URI string (with "e2e" already in its path) for both this seeding
-  // connection AND `process.env.MONGODB_URI` below guarantees they match.
-  const uri = replSet.getUri("e2e");
+  // Deliberately a SEPARATE env var from DATABASE_URL (rather than reusing
+  // whatever's already in `.env.local`) — this suite TRUNCATEs every table
+  // before seeding, so it must never be pointed at a real dev/production
+  // database by an inherited env var. The "test"/"e2e" guardrail below is
+  // the same discipline already established in
+  // `lib/__tests__/integration/setup.ts`.
+  const uri =
+    process.env.E2E_DATABASE_URL ??
+    "postgresql://postgres:postgres@localhost:5432/telegram_panel_e2e?schema=public";
 
-  // Seed directly via a short-lived Mongoose connection, then disconnect —
-  // the `next start` server (spawned below, after env vars are set) opens
-  // its own connection via lib/db.ts#connectDB() as normal.
-  await mongoose.connect(uri);
+  if (!/test|e2e/i.test(uri)) {
+    throw new Error(
+      `globalSetup(): refusing to run against a database whose URL doesn't contain "test" or "e2e" ` +
+        `(got: ${uri.replace(/:[^:@]*@/, ":***@")}) — this suite TRUNCATEs every table before seeding. ` +
+        `Set E2E_DATABASE_URL to a dedicated database, e.g. telegram_panel_e2e.`
+    );
+  }
+
+  seedClient = new PrismaClient({ datasourceUrl: uri });
+  await seedClient.$connect();
+
+  // Wipe every table before seeding — this suite must start from a known,
+  // empty state every run, exactly like the old disposable-replica-set
+  // approach guaranteed for free. Order matters (children before parents)
+  // to satisfy foreign-key constraints — same ordering as
+  // lib/__tests__/integration/setup.ts#clearTestDb.
+  await seedClient.$transaction([
+    seedClient.notification.deleteMany(),
+    seedClient.ticketMessage.deleteMany(),
+    seedClient.supportTicket.deleteMany(),
+    seedClient.auditLog.deleteMany(),
+    seedClient.apiKey.deleteMany(),
+    seedClient.verificationToken.deleteMany(),
+    seedClient.payment.deleteMany(),
+    seedClient.transaction.deleteMany(),
+    seedClient.order.deleteMany(),
+    seedClient.favoriteService.deleteMany(),
+    seedClient.serviceProvider.deleteMany(),
+    seedClient.service.deleteMany(),
+    seedClient.category.deleteMany(),
+    seedClient.serviceGroup.deleteMany(),
+    seedClient.provider.deleteMany(),
+    seedClient.wallet.deleteMany(),
+    seedClient.telegramBotSession.deleteMany(),
+    seedClient.exchangeRateCache.deleteMany(),
+    seedClient.settings.deleteMany(),
+    seedClient.user.deleteMany(),
+  ]);
 
   const adminPasswordHash = await hash("AdminE2E!Pass1", 12);
-  const admin = await User.create({
-    name: "E2E Admin",
-    email: "e2e-admin@example.com",
-    passwordHash: adminPasswordHash,
-    role: "ADMIN",
-    status: "ACTIVE",
-    emailVerified: new Date(),
+  const admin = await seedClient.user.create({
+    data: {
+      name: "E2E Admin",
+      email: "e2e-admin@example.com",
+      passwordHash: adminPasswordHash,
+      role: "ADMIN",
+      status: "ACTIVE",
+      emailVerified: new Date(),
+    },
   });
-  await Wallet.create({ userId: admin._id, balance: 0, currency: "USD" });
+  await seedClient.wallet.create({ data: { userId: admin.id, balance: toDecimal128("0"), currency: "USD" } });
 
   // A second, pre-verified, ACTIVE customer with a funded wallet — used by
   // the order-placement happy-path test so that test doesn't also have to
@@ -150,42 +179,46 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   // stays focused on one flow, per the project's own testing philosophy
   // established in the integration suite: prefer several precise tests
   // over one giant chained one that's hard to debug when it fails).
-  const funded = await User.create({
-    name: "E2E Funded Customer",
-    email: "e2e-funded@example.com",
-    passwordHash: await hash("FundedE2E!Pass1", 12),
-    role: "USER",
-    status: "ACTIVE",
-    emailVerified: new Date(),
+  const funded = await seedClient.user.create({
+    data: {
+      name: "E2E Funded Customer",
+      email: "e2e-funded@example.com",
+      passwordHash: await hash("FundedE2E!Pass1", 12),
+      role: "USER",
+      status: "ACTIVE",
+      emailVerified: new Date(),
+    },
   });
-  await Wallet.create({ userId: funded._id, balance: mongoose.Types.Decimal128.fromString("500"), currency: "USD" });
-
-  const category = await Category.create({
-    name: "E2E Test Category",
-    slug: "e2e-test-category",
-    active: true,
-    sortOrder: 0,
-  });
-  await Service.create({
-    categoryId: category._id,
-    name: "E2E Smoke Test Service",
-    description: "Seeded for the Playwright e2e smoke suite only.",
-    type: "DEFAULT",
-    rate: mongoose.Types.Decimal128.fromString("1.5"),
-    providerId: null,
-    providerServiceId: null,
-    providerRate: null,
-    minQuantity: 10,
-    maxQuantity: 10000,
-    active: true,
-    hidden: false,
-    refillDays: null,
-    estimatedDeliveryMinutes: null,
+  await seedClient.wallet.create({
+    data: { userId: funded.id, balance: toDecimal128("500"), currency: "USD" },
   });
 
-  await getSettings();
+  const category = await seedClient.category.create({
+    data: { name: "E2E Test Category", slug: "e2e-test-category", active: true, sortOrder: 0 },
+  });
+  await seedClient.service.create({
+    data: {
+      categoryId: category.id,
+      name: "E2E Smoke Test Service",
+      description: "Seeded for the Playwright e2e smoke suite only.",
+      type: "DEFAULT",
+      rate: toDecimal128("1.5"),
+      providerId: null,
+      providerServiceId: null,
+      providerRate: null,
+      minQuantity: 10,
+      maxQuantity: 10000,
+      active: true,
+      hidden: false,
+      refillDays: null,
+      estimatedDeliveryMinutes: null,
+    },
+  });
 
-  await mongoose.disconnect();
+  await seedClient.settings.upsert({ where: { key: "global" }, create: { key: "global" }, update: {} });
+
+  await seedClient.$disconnect();
+  seedClient = undefined;
 
   // Where the server's stdout/stderr will be redirected so
   // e2e/helpers.ts#readLatestVerificationLink can recover a real
@@ -196,7 +229,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   writeFileSync(logPath, "");
   process.env.E2E_SERVER_LOG_PATH = logPath;
 
-  process.env.MONGODB_URI = uri;
+  process.env.DATABASE_URL = uri;
+  process.env.DIRECT_URL = uri;
   process.env.AUTH_SECRET = "e2e-smoke-test-secret-value-not-a-real-secret-32ch";
   process.env.NEXTAUTH_URL = `http://localhost:${TEST_PORT}`;
   process.env.NEXT_PUBLIC_APP_URL = `http://localhost:${TEST_PORT}`;
@@ -263,7 +297,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
         // Process group may already be gone — nothing left to clean up.
       }
     }
-    await replSet?.stop();
+    await seedClient?.$disconnect();
   };
 }
 

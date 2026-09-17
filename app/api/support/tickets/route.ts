@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 import { ticketSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { notifyAdminNewTicket } from "@/lib/telegram/notify";
@@ -15,12 +14,10 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await connectDB();
-
-  const tickets = await SupportTicket.find({ userId: session.user.id })
-    .select("-messages")
-    .sort({ updatedAt: -1 })
-    .lean();
+  const tickets = await prisma.supportTicket.findMany({
+    where: { userId: session.user.id },
+    orderBy: { updatedAt: "desc" },
+  });
 
   return NextResponse.json({ tickets });
 }
@@ -37,8 +34,6 @@ export async function POST(request: Request) {
   if (!success) {
     return NextResponse.json({ error: "Too many tickets created. Please try again later." }, { status: 429 });
   }
-
-  await connectDB();
 
   const body = await request.json();
   const parsed = ticketSchema.safeParse(body);

@@ -1,9 +1,4 @@
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
-import { Order } from "@/models/Order";
-import { Payment } from "@/models/Payment";
-import { SupportTicket } from "@/models/SupportTicket";
-import { AuditLog } from "@/models/AuditLog";
+import { prisma } from "@/lib/db";
 import {
   getRevenueSeries,
   getOrderStatusBreakdown,
@@ -17,22 +12,20 @@ import { RecentActivityFeed, type ActivityRow } from "@/components/admin/recent-
 import Link from "next/link";
 
 export default async function AdminDashboardPage() {
-  await connectDB();
-
   const [totalUsers, totalOrders, pendingPayments, openTickets, revenueSeries, statusBreakdown, topServices, recentAudit] =
     await Promise.all([
-      User.countDocuments(),
-      Order.countDocuments(),
-      Payment.countDocuments({ status: "PENDING" }),
-      SupportTicket.countDocuments({ status: { $in: ["OPEN", "ANSWERED"] } }),
+      prisma.user.count(),
+      prisma.order.count(),
+      prisma.payment.count({ where: { status: "PENDING" } }),
+      prisma.supportTicket.count({ where: { status: { in: ["OPEN", "ANSWERED"] } } }),
       getRevenueSeries(30),
       getOrderStatusBreakdown(),
       getTopServices(5, 30),
-      AuditLog.find().sort({ createdAt: -1 }).limit(8).lean(),
+      prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 8 }),
     ]);
 
   const activityRows: ActivityRow[] = recentAudit.map((a) => ({
-    _id: a._id.toString(),
+    _id: a.id,
     actorEmail: a.actorEmail,
     action: a.action,
     targetType: a.targetType,

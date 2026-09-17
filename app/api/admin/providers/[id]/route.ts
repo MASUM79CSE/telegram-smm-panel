@@ -1,12 +1,9 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Provider } from "@/models/Provider";
+import { prisma } from "@/lib/db";
 import { providerSchema } from "@/lib/validation";
 import { encryptSecret } from "@/lib/crypto";
 import { recordAudit } from "@/lib/audit";
-import { Service } from "@/models/Service";
-import { ServiceProvider } from "@/models/ServiceProvider";
 
 export async function PATCH(
   request: Request,
@@ -17,7 +14,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -32,7 +28,9 @@ export async function PATCH(
     update.apiKeyEncrypted = encryptSecret(apiKey);
   }
 
-  const provider = await Provider.findByIdAndUpdate(id, update, { returnDocument: "after" });
+  const provider = await prisma.provider
+    .update({ where: { id }, data: update, omit: { apiKeyEncrypted: true } })
+    .catch(() => null);
   if (!provider) {
     return NextResponse.json({ error: "Provider not found" }, { status: 404 });
   }
@@ -46,10 +44,7 @@ export async function PATCH(
     request,
   });
 
-  const safe = provider.toObject();
-  delete (safe as { apiKeyEncrypted?: unknown }).apiKeyEncrypted;
-
-  return NextResponse.json({ message: "Provider updated", provider: safe });
+  return NextResponse.json({ message: "Provider updated", provider });
 }
 
 export async function DELETE(
@@ -61,7 +56,6 @@ export async function DELETE(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   // Check BOTH the legacy single-provider link on Service and the
@@ -71,8 +65,8 @@ export async function DELETE(
   // from under a live dispatch fallback chain (found during Phase 2.1
   // review, fixed before it could cause an orphaned-reference bug).
   const [serviceCount, serviceProviderCount] = await Promise.all([
-    Service.countDocuments({ providerId: id }),
-    ServiceProvider.countDocuments({ providerId: id }),
+    prisma.service.count({ where: { providerId: id } }),
+    prisma.serviceProvider.count({ where: { providerId: id } }),
   ]);
   if (serviceCount > 0 || serviceProviderCount > 0) {
     const parts = [];
@@ -84,7 +78,7 @@ export async function DELETE(
     );
   }
 
-  const provider = await Provider.findByIdAndDelete(id);
+  const provider = await prisma.provider.delete({ where: { id } }).catch(() => null);
   if (!provider) {
     return NextResponse.json({ error: "Provider not found" }, { status: 404 });
   }

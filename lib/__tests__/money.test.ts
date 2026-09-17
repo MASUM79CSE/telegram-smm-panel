@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Decimal128 } from "mongodb";
+import { Prisma } from "@/lib/generated/prisma";
 import {
   toDecimal128,
   decimalToNumber,
@@ -108,7 +108,7 @@ describe("lib/money", () => {
   });
 
   describe("formatMoney", () => {
-    it("formats a Decimal128 as USD currency by default", () => {
+    it("formats a Decimal as USD currency by default", () => {
       const formatted = formatMoney(toDecimal128(19.99));
       expect(formatted).toContain("19.99");
       expect(formatted).toMatch(/\$/);
@@ -119,8 +119,8 @@ describe("lib/money", () => {
       expect(formatted).toContain("5.00");
     });
 
-    it("formats Decimal128.fromString directly (not just via toDecimal128)", () => {
-      const formatted = formatMoney(Decimal128.fromString("1000.5"));
+    it("formats a Prisma.Decimal constructed directly (not just via toDecimal128)", () => {
+      const formatted = formatMoney(new Prisma.Decimal("1000.5"));
       expect(formatted).toContain("1,000.50");
     });
   });

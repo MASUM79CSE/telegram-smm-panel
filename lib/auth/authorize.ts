@@ -1,7 +1,6 @@
 import { compare } from "bcryptjs";
 
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { recordAudit } from "@/lib/audit";
 import { loginSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
@@ -47,20 +46,15 @@ export async function authorizeCredentials(
   // its own hand-rolled schema that skipped both steps, so a stray
   // leading/trailing space — extremely common from browser autofill,
   // password managers, or copy/pasting an email address — meant the
-  // exact-match `User.findOne({ email })` lookup below never matched an
-  // otherwise-correct, existing account, always producing the generic
-  // "Invalid email or password" error even though the account and
-  // password were both fine.
+  // exact-match lookup below never matched an otherwise-correct, existing
+  // account, always producing the generic "Invalid email or password"
+  // error even though the account and password were both fine.
   const parsed = loginSchema.safeParse(credentials);
   if (!parsed.success) return null;
 
   const { email, password } = parsed.data;
 
-  await connectDB();
-
-  const user = await User.findOne({ email }).select(
-    "+passwordHash name email role status failedLoginAttempts lockedUntil"
-  );
+  const user = await prisma.user.findUnique({ where: { email } });
 
   if (!user || !user.passwordHash) {
     // Constant-time-ish: still run a compare against a dummy hash to
@@ -81,38 +75,45 @@ export async function authorizeCredentials(
   const valid = await compare(password, user.passwordHash);
 
   if (!valid) {
-    user.failedLoginAttempts += 1;
-    if (user.failedLoginAttempts >= LOCKOUT_THRESHOLD) {
-      user.lockedUntil = new Date(Date.now() + LOCKOUT_DURATION_MS);
-    }
-    await user.save();
+    const failedLoginAttempts = user.failedLoginAttempts + 1;
+    const lockedUntil =
+      failedLoginAttempts >= LOCKOUT_THRESHOLD ? new Date(Date.now() + LOCKOUT_DURATION_MS) : user.lockedUntil;
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts, lockedUntil },
+    });
 
     await recordAudit({
       actorEmail: email,
       action: "LOGIN_FAILED",
       targetType: "User",
-      targetId: user._id.toString(),
+      targetId: user.id,
     });
 
     return null;
   }
 
   // Successful login — reset lockout counters
-  user.failedLoginAttempts = 0;
-  user.lockedUntil = null;
-  user.lastLoginAt = new Date();
-  await user.save();
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+      lastLoginAt: new Date(),
+    },
+  });
 
   await recordAudit({
-    actorId: user._id,
+    actorId: user.id,
     actorEmail: user.email,
     action: "LOGIN_SUCCESS",
     targetType: "User",
-    targetId: user._id.toString(),
+    targetId: user.id,
   });
 
   return {
-    id: user._id.toString(),
+    id: user.id,
     email: user.email,
     name: user.name,
     role: user.role,

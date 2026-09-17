@@ -1,6 +1,7 @@
-import { Payment, type PaymentMethod } from "@/models/Payment";
-import { getSettings } from "@/models/Settings";
+import { prisma } from "@/lib/db";
+import type { PaymentMethod } from "@/lib/generated/prisma";
 import { AppError } from "@/lib/errors";
+import { decimalToNumber } from "@/lib/money";
 
 /**
  * Shared deposit-submission logic used by both the website (`app/api/payments/route.ts`)
@@ -14,26 +15,32 @@ export async function submitDeposit(params: {
 }) {
   const { userId, amount, method, transactionRef } = params;
 
-  const settings = await getSettings();
+  const settings = await prisma.settings.upsert({
+    where: { key: "global" },
+    create: { key: "global" },
+    update: {},
+  });
 
-  if (amount < settings.minDeposit || amount > settings.maxDeposit) {
-    throw new AppError(
-      "AMOUNT_OUT_OF_RANGE",
-      `Deposit amount must be between ${settings.minDeposit} and ${settings.maxDeposit}.`
-    );
+  const min = decimalToNumber(settings.minDeposit);
+  const max = decimalToNumber(settings.maxDeposit);
+
+  if (amount < min || amount > max) {
+    throw new AppError("AMOUNT_OUT_OF_RANGE", `Deposit amount must be between ${min} and ${max}.`);
   }
 
-  const existing = await Payment.findOne({ transactionRef });
+  const existing = await prisma.payment.findUnique({ where: { transactionRef } });
   if (existing) {
     throw new AppError("DUPLICATE_REFERENCE", "This transaction reference has already been submitted.");
   }
 
-  const payment = await Payment.create({
-    userId,
-    amount,
-    method,
-    transactionRef,
-    status: "PENDING",
+  const payment = await prisma.payment.create({
+    data: {
+      userId,
+      amount,
+      method,
+      transactionRef,
+      status: "PENDING",
+    },
   });
 
   return payment;

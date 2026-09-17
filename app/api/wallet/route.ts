@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Wallet } from "@/models/Wallet";
-import { Transaction } from "@/models/Transaction";
+import { prisma } from "@/lib/db";
 import { requestLogger } from "@/lib/logger";
 
 export async function GET(request: Request) {
@@ -13,21 +11,20 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    await connectDB();
-
     const { searchParams } = new URL(request.url);
     const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10));
     const limit = Math.min(50, Math.max(1, parseInt(searchParams.get("limit") || "20", 10)));
 
-    const wallet = await Wallet.findOne({ userId: session.user.id }).lean();
+    const wallet = await prisma.wallet.findUnique({ where: { userId: session.user.id } });
 
     const [transactions, total] = await Promise.all([
-      Transaction.find({ userId: session.user.id })
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      Transaction.countDocuments({ userId: session.user.id }),
+      prisma.transaction.findMany({
+        where: { userId: session.user.id },
+        orderBy: { createdAt: "desc" },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.transaction.count({ where: { userId: session.user.id } }),
     ]);
 
     return NextResponse.json({ wallet, transactions, total, page, limit });

@@ -1,5 +1,5 @@
-import { Notification, type NotificationType } from "@/models/Notification";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
+import type { NotificationType } from "@/lib/generated/prisma";
 import { logger } from "@/lib/logger";
 
 /**
@@ -17,12 +17,14 @@ export async function createNotification(params: {
   href?: string | null;
 }): Promise<void> {
   try {
-    await Notification.create({
-      userId: params.userId,
-      type: params.type,
-      title: params.title,
-      body: params.body,
-      href: params.href ?? null,
+    await prisma.notification.create({
+      data: {
+        userId: params.userId,
+        type: params.type,
+        title: params.title,
+        body: params.body,
+        href: params.href ?? null,
+      },
     });
   } catch (err) {
     logger.error({ err, userId: params.userId, type: params.type }, "[notifications] Failed to create notification");
@@ -37,41 +39,45 @@ export async function notifyAllAdmins(params: {
   href?: string | null;
 }): Promise<void> {
   try {
-    const admins = await User.find({ role: "ADMIN" }).select("_id").lean();
-    await Notification.insertMany(
-      admins.map((a) => ({
-        userId: a._id,
+    const admins = await prisma.user.findMany({ where: { role: "ADMIN" }, select: { id: true } });
+    await prisma.notification.createMany({
+      data: admins.map((a) => ({
+        userId: a.id,
         type: params.type,
         title: params.title,
         body: params.body,
         href: params.href ?? null,
-      }))
-    );
+      })),
+    });
   } catch (err) {
     logger.error({ err, type: params.type }, "[notifications] Failed to fan out admin notification");
   }
 }
 
 export async function getUnreadCount(userId: string): Promise<number> {
-  return Notification.countDocuments({ userId, read: false });
+  return prisma.notification.count({ where: { userId, read: false } });
 }
 
 export async function getRecentNotifications(userId: string, limit = 10) {
-  return Notification.find({ userId }).sort({ createdAt: -1 }).limit(limit).lean();
+  return prisma.notification.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" },
+    take: limit,
+  });
 }
 
 export async function markAsRead(id: string, userId: string): Promise<boolean> {
-  const result = await Notification.updateOne(
-    { _id: id, userId },
-    { $set: { read: true, readAt: new Date() } }
-  );
-  return result.modifiedCount === 1;
+  const result = await prisma.notification.updateMany({
+    where: { id, userId },
+    data: { read: true, readAt: new Date() },
+  });
+  return result.count === 1;
 }
 
 export async function markAllAsRead(userId: string): Promise<number> {
-  const result = await Notification.updateMany(
-    { userId, read: false },
-    { $set: { read: true, readAt: new Date() } }
-  );
-  return result.modifiedCount;
+  const result = await prisma.notification.updateMany({
+    where: { userId, read: false },
+    data: { read: true, readAt: new Date() },
+  });
+  return result.count;
 }

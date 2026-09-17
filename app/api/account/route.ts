@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { accountUpdateSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 import { requestLogger } from "@/lib/logger";
@@ -32,13 +31,13 @@ export async function PATCH(request: Request) {
       );
     }
 
-    await connectDB();
-
-    const user = await User.findByIdAndUpdate(
-      session.user.id,
-      { name: parsed.data.name },
-      { returnDocument: "after" }
-    ).select("name email");
+    const user = await prisma.user
+      .update({
+        where: { id: session.user.id },
+        data: { name: parsed.data.name },
+        select: { name: true, email: true },
+      })
+      .catch(() => null);
 
     if (!user) {
       return NextResponse.json({ error: "Account not found" }, { status: 404 });

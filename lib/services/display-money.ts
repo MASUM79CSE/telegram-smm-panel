@@ -1,7 +1,7 @@
 import { decimalToNumber } from "@/lib/money";
 import { convertFromUsd, getExchangeRates } from "@/lib/currency";
 import { defaultDisplayCurrencyForLocale, formatCurrencyAmount, type DisplayCurrency } from "@/lib/currency-format";
-import type { Decimal128 } from "mongodb";
+import type { Money } from "@/lib/money";
 
 /**
  * Server-side helper that pairs the canonical USD amount (always shown,
@@ -22,7 +22,7 @@ export interface DisplayMoney {
 }
 
 export async function getDisplayMoney(
-  amount: Decimal128 | number | string,
+  amount: Money | number | string,
   locale: string
 ): Promise<DisplayMoney> {
   const usd = decimalToNumber(amount);
@@ -50,7 +50,7 @@ export async function getDisplayMoney(
  * unavailable, same contract as `getDisplayMoney`.
  */
 export async function getDisplayMoneyBatch(
-  amounts: Array<Decimal128 | number | string>,
+  amounts: Array<Money | number | string>,
   locale: string
 ): Promise<DisplayMoney[]> {
   const targetCurrency = defaultDisplayCurrencyForLocale(locale);

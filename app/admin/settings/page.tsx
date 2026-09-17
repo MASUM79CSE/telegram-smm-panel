@@ -1,9 +1,8 @@
-import { connectDB } from "@/lib/db";
-import { getSettings } from "@/models/Settings";
+import { getSettings } from "@/lib/services/settings";
+import { decimalToNumber } from "@/lib/money";
 import { SettingsForm } from "@/components/admin/settings-form";
 
 export default async function AdminSettingsPage() {
-  await connectDB();
   const settings = await getSettings();
 
   return (
@@ -18,8 +17,8 @@ export default async function AdminSettingsPage() {
           siteName: settings.siteName,
           siteDescription: settings.siteDescription,
           supportEmail: settings.supportEmail,
-          minDeposit: settings.minDeposit,
-          maxDeposit: settings.maxDeposit,
+          minDeposit: decimalToNumber(settings.minDeposit),
+          maxDeposit: decimalToNumber(settings.maxDeposit),
           registrationEnabled: settings.registrationEnabled,
           maintenanceMode: settings.maintenanceMode,
         }}

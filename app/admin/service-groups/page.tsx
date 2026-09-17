@@ -1,14 +1,12 @@
 import Link from "next/link";
-import { connectDB } from "@/lib/db";
-import { ServiceGroup } from "@/models/ServiceGroup";
+import { prisma } from "@/lib/db";
 import { ServiceGroupsManager } from "@/components/admin/service-groups-manager";
 
 export default async function AdminServiceGroupsPage() {
-  await connectDB();
-  const groups = await ServiceGroup.find().sort({ sortOrder: 1, name: 1 }).lean();
+  const groups = await prisma.serviceGroup.findMany({ orderBy: [{ sortOrder: "asc" }, { name: "asc" }] });
 
   const rows = groups.map((g) => ({
-    _id: g._id.toString(),
+    _id: g.id,
     name: g.name,
     icon: g.icon,
     active: g.active,

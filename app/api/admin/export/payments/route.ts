@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Payment } from "@/models/Payment";
+import { prisma } from "@/lib/db";
 import { parseDateRange } from "@/lib/admin-query";
 import { toCsv } from "@/lib/csv";
 import { recordAudit } from "@/lib/audit";
+import type { Prisma } from "@/lib/generated/prisma";
 
 const MAX_EXPORT_ROWS = 10000;
 
@@ -14,24 +14,23 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const { searchParams } = new URL(request.url);
   const dateRange = parseDateRange(searchParams.get("from"), searchParams.get("to"));
 
-  const filter: Record<string, unknown> = {};
-  if (dateRange) filter.createdAt = dateRange;
+  const where: Prisma.PaymentWhereInput = {};
+  if (dateRange) where.createdAt = dateRange;
 
-  const payments = await Payment.find(filter)
-    .populate("userId", "email")
-    .sort({ createdAt: -1 })
-    .limit(MAX_EXPORT_ROWS)
-    .lean();
+  const payments = await prisma.payment.findMany({
+    where,
+    include: { user: { select: { email: true } } },
+    orderBy: { createdAt: "desc" },
+    take: MAX_EXPORT_ROWS,
+  });
 
   const rows = payments.map((p) => ({
-    id: p._id.toString(),
+    id: p.id,
     createdAt: p.createdAt.toISOString(),
-    userEmail: (p.userId as unknown as { email?: string } | null)?.email ?? "",
+    userEmail: p.user?.email ?? "",
     amount: p.amount.toString(),
     method: p.method,
     transactionRef: p.transactionRef ?? "",

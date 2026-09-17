@@ -1,9 +1,10 @@
 import { Bot, session, InlineKeyboard } from "grammy";
+import type { StorageAdapter } from "grammy";
 import { conversations } from "@grammyjs/conversations";
-import { MongoDBAdapter } from "@grammyjs/storage-mongodb";
 
 import { env } from "@/lib/env";
-import { connectDB } from "@/lib/db";
+import { prisma } from "@/lib/db";
+import type { Prisma } from "@/lib/generated/prisma";
 import type { BotContext, SessionData } from "@/lib/telegram/types";
 import { logger } from "@/lib/logger";
 
@@ -11,10 +12,39 @@ let botInstance: Bot<BotContext> | null = null;
 let initPromise: Promise<Bot<BotContext>> | null = null;
 
 /**
+ * grammY session storage backed by the `TelegramBotSession` table via
+ * Prisma, replacing `@grammyjs/storage-mongodb` (which required the shared
+ * Mongoose connection's native driver handle — no longer available after
+ * the Postgres migration). No `@grammyjs/storage-prisma` package exists,
+ * so this implements grammY's small `StorageAdapter` interface directly —
+ * only three methods are required (`read`/`write`/`delete`), which map
+ * 1:1 onto `findUnique`/`upsert`/`delete` against the single-row-per-key
+ * table. See prisma/schema.prisma's own comment on that model.
+ */
+const prismaStorageAdapter: StorageAdapter<SessionData> = {
+  async read(key) {
+    const row = await prisma.telegramBotSession.findUnique({ where: { key } });
+    return row ? (row.data as unknown as SessionData) : undefined;
+  },
+  async write(key, value) {
+    await prisma.telegramBotSession.upsert({
+      where: { key },
+      update: { data: value as unknown as Prisma.InputJsonValue },
+      create: { key, data: value as unknown as Prisma.InputJsonValue },
+    });
+  },
+  async delete(key) {
+    await prisma.telegramBotSession.delete({ where: { key } }).catch(() => {
+      // Already absent — deleting a non-existent session key is a no-op,
+      // matching grammY's own documented "delete" contract.
+    });
+  },
+};
+
+/**
  * Lazily constructs (once per server process) the grammY bot instance with
- * session storage backed by the same MongoDB connection as the rest of the
- * app (via the shared Mongoose connection's native driver handle) — no
- * second database connection to manage.
+ * session storage backed by the same Postgres database as the rest of the
+ * app (via Prisma) — no second database connection to manage.
  *
  * Returns null if TELEGRAM_BOT_TOKEN isn't configured, so every caller can
  * simply no-op instead of crashing when the bot isn't set up yet.
@@ -25,23 +55,12 @@ export async function getBot(): Promise<Bot<BotContext> | null> {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    const mongoose = await connectDB();
-    // `@grammyjs/storage-mongodb` ships its own bundled/rolled-up `mongodb`
-    // type declarations (a different nominal type than the `mongodb` package
-    // resolved elsewhere in this project via mongoose), so the structurally
-    // identical `Collection` type doesn't type-check as assignable. The
-    // runtime object is a completely normal MongoDB driver Collection —
-    // safe to cast through `unknown`.
-    const collection = mongoose.connection.db!.collection("telegram_bot_sessions") as unknown as ConstructorParameters<
-      typeof MongoDBAdapter
-    >[0]["collection"];
-
     const bot = new Bot<BotContext>(env.TELEGRAM_BOT_TOKEN!);
 
     bot.use(
       session({
         initial: (): SessionData => ({}),
-        storage: new MongoDBAdapter({ collection }),
+        storage: prismaStorageAdapter,
       })
     );
     bot.use(conversations());

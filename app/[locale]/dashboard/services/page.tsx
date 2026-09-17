@@ -1,35 +1,31 @@
 import { getLocale, getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Service } from "@/models/Service";
-import { Category } from "@/models/Category";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { OrderForm } from "@/components/dashboard/order-form";
 import { defaultDisplayCurrencyForLocale } from "@/lib/currency-format";
 import { convertFromUsd } from "@/lib/currency";
 
 export default async function ServicesPage() {
   const session = await auth();
-  await connectDB();
   const locale = await getLocale();
   const t = await getTranslations("Dashboard.services");
 
-  const [services, categories, user] = await Promise.all([
-    Service.find({ active: true, hidden: false }).sort({ name: 1 }).lean(),
-    Category.find({ active: true }).sort({ sortOrder: 1 }).lean(),
-    User.findById(session!.user.id).select("favoriteServiceIds").lean(),
+  const [services, categories, favorites] = await Promise.all([
+    prisma.service.findMany({ where: { active: true, hidden: false }, orderBy: { name: "asc" } }),
+    prisma.category.findMany({ where: { active: true }, orderBy: { sortOrder: "asc" } }),
+    prisma.favoriteService.findMany({ where: { userId: session!.user.id }, select: { serviceId: true } }),
   ]);
 
-  const favoriteIds = new Set((user?.favoriteServiceIds ?? []).map((id) => id.toString()));
+  const favoriteIds = new Set(favorites.map((f) => f.serviceId));
 
   const serviceOptions = services.map((s) => ({
-    _id: s._id.toString(),
+    _id: s.id,
     name: s.name,
     rate: s.rate.toString(),
     minQuantity: s.minQuantity,
     maxQuantity: s.maxQuantity,
-    categoryId: s.categoryId.toString(),
-    isFavorite: favoriteIds.has(s._id.toString()),
+    categoryId: s.categoryId,
+    isFavorite: favoriteIds.has(s.id),
   }));
 
   // Phase 4 currency-display: resolve one live USD->local rate server-side
@@ -53,4 +49,3 @@ export default async function ServicesPage() {
     </div>
   );
 }
-

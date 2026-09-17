@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
+import { prisma } from "@/lib/db";
 import { parseDateRange } from "@/lib/admin-query";
 import { toCsv } from "@/lib/csv";
 import { recordAudit } from "@/lib/audit";
+import type { Prisma } from "@/lib/generated/prisma";
 
 /**
  * Streams a CSV export of orders within an optional `[from, to]` date
@@ -22,26 +22,27 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const { searchParams } = new URL(request.url);
   const dateRange = parseDateRange(searchParams.get("from"), searchParams.get("to"));
 
-  const filter: Record<string, unknown> = {};
-  if (dateRange) filter.createdAt = dateRange;
+  const where: Prisma.OrderWhereInput = {};
+  if (dateRange) where.createdAt = dateRange;
 
-  const orders = await Order.find(filter)
-    .populate("userId", "email")
-    .populate("serviceId", "name")
-    .sort({ createdAt: -1 })
-    .limit(MAX_EXPORT_ROWS)
-    .lean();
+  const orders = await prisma.order.findMany({
+    where,
+    include: {
+      user: { select: { email: true } },
+      service: { select: { name: true } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: MAX_EXPORT_ROWS,
+  });
 
   const rows = orders.map((o) => ({
-    id: o._id.toString(),
+    id: o.id,
     createdAt: o.createdAt.toISOString(),
-    userEmail: (o.userId as unknown as { email?: string } | null)?.email ?? "",
-    service: (o.serviceId as unknown as { name?: string } | null)?.name ?? "",
+    userEmail: o.user?.email ?? "",
+    service: o.service?.name ?? "",
     target: o.target,
     quantity: o.quantity,
     charge: o.charge.toString(),

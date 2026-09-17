@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Service } from "@/models/Service";
+import { prisma } from "@/lib/db";
 import { serviceBaseSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -14,7 +13,6 @@ export async function PATCH(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -34,7 +32,7 @@ export async function PATCH(
   // silently skipped).
   const existingForValidation =
     parsed.data.minQuantity !== undefined || parsed.data.maxQuantity !== undefined
-      ? await Service.findById(id).select("minQuantity maxQuantity")
+      ? await prisma.service.findUnique({ where: { id }, select: { minQuantity: true, maxQuantity: true } })
       : null;
 
   const effectiveMin = parsed.data.minQuantity ?? existingForValidation?.minQuantity;
@@ -53,7 +51,7 @@ export async function PATCH(
     );
   }
 
-  const service = await Service.findByIdAndUpdate(id, parsed.data, { returnDocument: "after" });
+  const service = await prisma.service.update({ where: { id }, data: parsed.data }).catch(() => null);
   if (!service) {
     return NextResponse.json({ error: "Service not found" }, { status: 404 });
   }
@@ -79,12 +77,13 @@ export async function DELETE(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   // Soft-delete pattern: deactivate rather than hard-delete, since existing
   // orders reference this service and must remain viewable/consistent.
-  const service = await Service.findByIdAndUpdate(id, { active: false, hidden: true }, { returnDocument: "after" });
+  const service = await prisma.service
+    .update({ where: { id }, data: { active: false, hidden: true } })
+    .catch(() => null);
   if (!service) {
     return NextResponse.json({ error: "Service not found" }, { status: 404 });
   }

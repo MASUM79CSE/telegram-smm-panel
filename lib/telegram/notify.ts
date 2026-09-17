@@ -2,12 +2,9 @@ import { InlineKeyboard } from "grammy";
 import { sendTelegramMessage } from "@/lib/telegram/client";
 import { escapeHtml } from "@/lib/telegram/format";
 import { env } from "@/lib/env";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { formatMoney } from "@/lib/money";
-import type { HydratedDocument } from "mongoose";
-import type { IOrder } from "@/models/Order";
-import type { IPayment } from "@/models/Payment";
-import type { ISupportTicket } from "@/models/SupportTicket";
+import type { Order, Payment, SupportTicket } from "@/lib/generated/prisma";
 import { logger } from "@/lib/logger";
 
 /**
@@ -29,7 +26,7 @@ async function notifyAdmin(text: string, replyMarkup?: InlineKeyboard): Promise<
 
 async function notifyUserByTelegram(userId: string, text: string): Promise<void> {
   try {
-    const user = await User.findById(userId).select("telegramId").lean();
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { telegramId: true } });
     if (!user?.telegramId) return;
     await sendTelegramMessage(user.telegramId, text);
   } catch (err) {
@@ -37,7 +34,7 @@ async function notifyUserByTelegram(userId: string, text: string): Promise<void>
   }
 }
 
-export async function notifyOrderPlaced(order: HydratedDocument<IOrder>): Promise<void> {
+export async function notifyOrderPlaced(order: Order): Promise<void> {
   const keyboard = new InlineKeyboard().url(
     "🔗 View in Admin Dashboard",
     `${env.NEXT_PUBLIC_APP_URL}/admin/orders`
@@ -45,7 +42,7 @@ export async function notifyOrderPlaced(order: HydratedDocument<IOrder>): Promis
 
   await notifyAdmin(
     `🛒 <b>New order placed</b>\n` +
-      `Order: <code>${order._id.toString()}</code>\n` +
+      `Order: <code>${order.id}</code>\n` +
       `Quantity: ${order.quantity}\n` +
       `Charge: ${formatMoney(order.charge)}\n` +
       `Target: ${escapeHtml(order.target)}`,
@@ -67,10 +64,10 @@ export async function notifyOrderStatusChanged(
   );
 }
 
-export async function notifyAdminNewDeposit(payment: HydratedDocument<IPayment>): Promise<void> {
+export async function notifyAdminNewDeposit(payment: Payment): Promise<void> {
   const keyboard = new InlineKeyboard()
-    .text("✅ Approve", `dep:approve:${payment._id.toString()}`)
-    .text("❌ Reject", `dep:reject:${payment._id.toString()}`);
+    .text("✅ Approve", `dep:approve:${payment.id}`)
+    .text("❌ Reject", `dep:reject:${payment.id}`);
 
   await notifyAdmin(
     `💰 <b>New deposit request</b>\n` +
@@ -96,10 +93,10 @@ export async function notifyUserDepositReviewed(
   );
 }
 
-export async function notifyAdminNewTicket(ticket: HydratedDocument<ISupportTicket>): Promise<void> {
+export async function notifyAdminNewTicket(ticket: SupportTicket): Promise<void> {
   const keyboard = new InlineKeyboard().url(
     "🔗 Reply in Admin Dashboard",
-    `${env.NEXT_PUBLIC_APP_URL}/admin/support/${ticket._id.toString()}`
+    `${env.NEXT_PUBLIC_APP_URL}/admin/support/${ticket.id}`
   );
 
   await notifyAdmin(

@@ -11,13 +11,13 @@ import { hash } from "bcryptjs";
  * `auth.ts` itself unimportable from a fast unit test. See
  * `lib/auth/authorize.ts`'s own doc comment for the full explanation.
  *
- * `@/lib/db`, `@/models/User`, and `@/lib/audit` are all mocked — this
+ * `@/lib/db` (the Prisma client) and `@/lib/audit` are both mocked — this
  * suite's job is the LOGIN LOGIC itself (rate limiting, malformed input,
  * unknown/wrong credentials, account lockout, inactive-status rejection,
  * successful login + lockout-counter reset), not a real DB round-trip;
  * that's already covered by the DB-backed integration suite's own
  * philosophy for the four money-moving service functions, and directly
- * exercised for real (via a live browser + real MongoDB replica set)
+ * exercised for real (via a live browser + real Postgres database)
  * against this exact code path by `e2e/auth.e2e.ts`.
  *
  * `@/lib/rate-limit` is mocked too, EXCEPT in the dedicated rate-limiting
@@ -33,23 +33,21 @@ import { hash } from "bcryptjs";
  * limit, only the separate per-account lockout this file also tests.
  */
 
-const mockFindOne = vi.fn();
-const mockUserSave = vi.fn();
+const mockFindUnique = vi.fn();
+const mockUserUpdate = vi.fn();
 const mockRecordAudit = vi.fn();
-const mockConnectDB = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("@/lib/db", () => ({
-  connectDB: mockConnectDB,
+  prisma: {
+    user: {
+      findUnique: mockFindUnique,
+      update: mockUserUpdate,
+    },
+  },
 }));
 
 vi.mock("@/lib/audit", () => ({
   recordAudit: mockRecordAudit,
-}));
-
-vi.mock("@/models/User", () => ({
-  User: {
-    findOne: mockFindOne,
-  },
 }));
 
 function req(): Request {
@@ -80,10 +78,9 @@ function uniqueTestIp(): string {
   return `198.51.100.${nextTestIpOctet}`;
 }
 
-
 function makeUserDoc(overrides: Record<string, unknown> = {}) {
   return {
-    _id: { toString: () => "507f1f77bcf86cd799439011" },
+    id: "507f1f77bcf86cd799439011",
     email: "user@example.com",
     name: "Test User",
     role: "USER",
@@ -92,16 +89,14 @@ function makeUserDoc(overrides: Record<string, unknown> = {}) {
     failedLoginAttempts: 0,
     lockedUntil: null as Date | null,
     lastLoginAt: null as Date | null,
-    save: mockUserSave,
     ...overrides,
   };
 }
 
 beforeEach(() => {
-  mockFindOne.mockReset();
-  mockUserSave.mockReset().mockResolvedValue(undefined);
+  mockFindUnique.mockReset();
+  mockUserUpdate.mockReset().mockResolvedValue(undefined);
   mockRecordAudit.mockReset().mockResolvedValue(undefined);
-  mockConnectDB.mockClear();
 });
 
 describe("auth.ts#authorizeCredentials — malformed/missing input", () => {
@@ -115,7 +110,7 @@ describe("auth.ts#authorizeCredentials — malformed/missing input", () => {
 
     const result = await authorizeCredentials({ password: "whatever" }, req());
     expect(result).toBeNull();
-    expect(mockFindOne).not.toHaveBeenCalled();
+    expect(mockFindUnique).not.toHaveBeenCalled();
     vi.doUnmock("@/lib/rate-limit");
   });
 
@@ -129,7 +124,7 @@ describe("auth.ts#authorizeCredentials — malformed/missing input", () => {
 
     const result = await authorizeCredentials({ email: "not-an-email", password: "x" }, req());
     expect(result).toBeNull();
-    expect(mockFindOne).not.toHaveBeenCalled();
+    expect(mockFindUnique).not.toHaveBeenCalled();
     vi.doUnmock("@/lib/rate-limit");
   });
 });
@@ -144,7 +139,7 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
   });
 
   it("rejects an email with no matching account (and never leaks that distinction to the caller)", async () => {
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(null) });
+    mockFindUnique.mockResolvedValue(null);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const result = await authorizeCredentials({ email: "nobody@example.com", password: "whatever" }, req());
@@ -154,15 +149,19 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
   it("rejects a correct email with the wrong password, and increments failedLoginAttempts", async () => {
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
     const user = makeUserDoc({ passwordHash });
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(user) });
+    mockFindUnique.mockResolvedValue(user);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const result = await authorizeCredentials({ email: "user@example.com", password: "WrongPassword1!" }, req());
 
     expect(result).toBeNull();
-    expect(user.failedLoginAttempts).toBe(1);
-    expect(user.lockedUntil).toBeNull();
-    expect(mockUserSave).toHaveBeenCalledTimes(1);
+    expect(mockUserUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUserUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: user.id },
+        data: expect.objectContaining({ failedLoginAttempts: 1, lockedUntil: null }),
+      })
+    );
     expect(mockRecordAudit).toHaveBeenCalledWith(
       expect.objectContaining({ action: "LOGIN_FAILED", actorEmail: "user@example.com" })
     );
@@ -171,20 +170,25 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
   it("locks the account after 5 cumulative failed attempts", async () => {
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
     const user = makeUserDoc({ passwordHash, failedLoginAttempts: 4 });
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(user) });
+    mockFindUnique.mockResolvedValue(user);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     await authorizeCredentials({ email: "user@example.com", password: "WrongPassword1!" }, req());
 
-    expect(user.failedLoginAttempts).toBe(5);
-    expect(user.lockedUntil).toBeInstanceOf(Date);
-    expect(user.lockedUntil!.getTime()).toBeGreaterThan(Date.now());
+    expect(mockUserUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: user.id },
+        data: expect.objectContaining({ failedLoginAttempts: 5, lockedUntil: expect.any(Date) }),
+      })
+    );
+    const call = mockUserUpdate.mock.calls[0][0];
+    expect(call.data.lockedUntil.getTime()).toBeGreaterThan(Date.now());
   });
 
   it("rejects a login attempt while the account is still locked, even with the correct password", async () => {
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
     const user = makeUserDoc({ passwordHash, lockedUntil: new Date(Date.now() + 60_000) });
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(user) });
+    mockFindUnique.mockResolvedValue(user);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const result = await authorizeCredentials(
@@ -193,15 +197,15 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
     );
 
     expect(result).toBeNull();
-    // The lockout check short-circuits before ever calling compare()/save()
-    // for this branch — confirmed by asserting save() was never reached.
-    expect(mockUserSave).not.toHaveBeenCalled();
+    // The lockout check short-circuits before ever calling compare()/update()
+    // for this branch — confirmed by asserting update() was never reached.
+    expect(mockUserUpdate).not.toHaveBeenCalled();
   });
 
   it("rejects a correct password for a non-ACTIVE (suspended/banned) account", async () => {
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
     const user = makeUserDoc({ passwordHash, status: "SUSPENDED" });
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(user) });
+    mockFindUnique.mockResolvedValue(user);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const result = await authorizeCredentials(
@@ -215,7 +219,7 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
   it("accepts the correct password for an ACTIVE account, resets lockout counters, and records LOGIN_SUCCESS", async () => {
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
     const user = makeUserDoc({ passwordHash, failedLoginAttempts: 3 });
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(user) });
+    mockFindUnique.mockResolvedValue(user);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const result = await authorizeCredentials(
@@ -230,20 +234,24 @@ describe("auth.ts#authorizeCredentials — credential verification", () => {
       role: "USER",
       status: "ACTIVE",
     });
-    expect(user.failedLoginAttempts).toBe(0);
-    expect(user.lockedUntil).toBeNull();
-    expect(user.lastLoginAt).toBeInstanceOf(Date);
+    expect(mockUserUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: user.id },
+        data: expect.objectContaining({ failedLoginAttempts: 0, lockedUntil: null, lastLoginAt: expect.any(Date) }),
+      })
+    );
     expect(mockRecordAudit).toHaveBeenCalledWith(
       expect.objectContaining({ action: "LOGIN_SUCCESS", actorEmail: "user@example.com" })
     );
   });
 
-  it("connects to the database before querying (connectDB() called)", async () => {
-    mockFindOne.mockReturnValue({ select: vi.fn().mockResolvedValue(null) });
+  it("queries the database via Prisma before returning a result", async () => {
+    mockFindUnique.mockResolvedValue(null);
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     await authorizeCredentials({ email: "nobody@example.com", password: "whatever" }, req());
-    expect(mockConnectDB).toHaveBeenCalledTimes(1);
+    expect(mockFindUnique).toHaveBeenCalledTimes(1);
+    expect(mockFindUnique).toHaveBeenCalledWith({ where: { email: "nobody@example.com" } });
   });
 });
 
@@ -263,19 +271,20 @@ describe("auth.ts#authorizeCredentials — IP-based login rate limiting (real li
     vi.doUnmock("@/lib/rate-limit");
     // lib/rate-limit.ts's getRedis() reads `env.UPSTASH_REDIS_REST_URL`
     // (via lib/env.ts's Zod-validated `env` proxy), which validates the
-    // ENTIRE env schema on first access — including MONGODB_URI/
-    // AUTH_SECRET, which this fast unit-test config deliberately leaves
-    // unset everywhere else in this suite (see vitest.config.mts's own
-    // comment) so that any route that reaches past its auth gate to a
-    // real DB call fails loudly. Here, unlike the rest of this file, the
-    // real (unmocked) lib/rate-limit.ts module IS the thing under test,
-    // so it needs the schema to validate successfully in order to reach
-    // its actual `!UPSTASH_REDIS_REST_URL` check and fall through to the
-    // in-memory limiter — these are throwaway values, never used to
-    // contact any real service (UPSTASH_* stays unset, so getRedis()
-    // still returns null and the in-memory path is what's actually
-    // exercised).
-    process.env.MONGODB_URI = "mongodb://localhost:27017/unit-test-placeholder";
+    // ENTIRE env schema on first access — including DATABASE_URL/
+    // DIRECT_URL/AUTH_SECRET, which this fast unit-test config
+    // deliberately leaves unset everywhere else in this suite (see
+    // vitest.config.mts's own comment) so that any route that reaches
+    // past its auth gate to a real DB call fails loudly. Here, unlike the
+    // rest of this file, the real (unmocked) lib/rate-limit.ts module IS
+    // the thing under test, so it needs the schema to validate
+    // successfully in order to reach its actual
+    // `!UPSTASH_REDIS_REST_URL` check and fall through to the in-memory
+    // limiter — these are throwaway values, never used to contact any
+    // real service (UPSTASH_* stays unset, so getRedis() still returns
+    // null and the in-memory path is what's actually exercised).
+    process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/unit-test-placeholder?schema=public";
+    process.env.DIRECT_URL = "postgresql://user:pass@localhost:5432/unit-test-placeholder?schema=public";
     process.env.AUTH_SECRET = "unit-test-placeholder-secret-not-a-real-secret-000";
   });
 
@@ -286,9 +295,7 @@ describe("auth.ts#authorizeCredentials — IP-based login rate limiting (real li
     // factor 12), so 20+ real compares in one test legitimately takes
     // longer than Vitest's 5s default.
     const passwordHash = await hash("CorrectHorseBattery1!", 12);
-    mockFindOne.mockReturnValue({
-      select: vi.fn().mockImplementation(() => Promise.resolve(makeUserDoc({ passwordHash }))),
-    });
+    mockFindUnique.mockImplementation(() => Promise.resolve(makeUserDoc({ passwordHash })));
     const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
     const ip = uniqueTestIp();
@@ -314,9 +321,7 @@ describe("auth.ts#authorizeCredentials — IP-based login rate limiting (real li
     "does not rate-limit a different IP even after another IP has exhausted its own limit",
     async () => {
       const passwordHash = await hash("CorrectHorseBattery1!", 12);
-      mockFindOne.mockReturnValue({
-        select: vi.fn().mockImplementation(() => Promise.resolve(makeUserDoc({ passwordHash }))),
-      });
+      mockFindUnique.mockImplementation(() => Promise.resolve(makeUserDoc({ passwordHash })));
       const { authorizeCredentials } = await import("@/lib/auth/authorize");
 
       const exhaustedIp = uniqueTestIp();

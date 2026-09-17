@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
-import { VerificationToken } from "@/models/VerificationToken";
+import { prisma } from "@/lib/db";
 import { forgotPasswordSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { generateRawToken, hashToken } from "@/lib/crypto";
@@ -19,25 +17,25 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Too many requests. Please try again later." }, { status: 429 });
     }
 
-    await connectDB();
-
     const body = await request.json();
     const parsed = forgotPasswordSchema.safeParse(body);
     if (!parsed.success) {
       return NextResponse.json({ error: "Invalid email" }, { status: 400 });
     }
 
-    const user = await User.findOne({ email: parsed.data.email });
+    const user = await prisma.user.findUnique({ where: { email: parsed.data.email } });
 
     // Always return the same success response regardless of whether the
     // account exists, to prevent user enumeration.
     if (user) {
       const rawToken = generateRawToken();
-      await VerificationToken.create({
-        userId: user._id,
-        tokenHash: hashToken(rawToken),
-        purpose: "PASSWORD_RESET",
-        expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
+      await prisma.verificationToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: hashToken(rawToken),
+          purpose: "PASSWORD_RESET",
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
+        },
       });
 
       const resetLink = `${env.NEXT_PUBLIC_APP_URL}/reset-password?token=${rawToken}`;

@@ -1,9 +1,7 @@
 import { NextResponse } from "next/server";
 import { hash } from "bcryptjs";
 
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
-import { VerificationToken } from "@/models/VerificationToken";
+import { prisma } from "@/lib/db";
 import { resetPasswordSchema } from "@/lib/validation";
 import { hashToken } from "@/lib/crypto";
 import { recordAudit } from "@/lib/audit";
@@ -12,8 +10,6 @@ import { requestLogger } from "@/lib/logger";
 export async function POST(request: Request) {
   const log = requestLogger(request);
   try {
-    await connectDB();
-
     const body = await request.json();
     const parsed = resetPasswordSchema.safeParse(body);
 
@@ -26,11 +22,13 @@ export async function POST(request: Request) {
 
     const tokenHash = hashToken(parsed.data.token);
 
-    const record = await VerificationToken.findOne({
-      tokenHash,
-      purpose: "PASSWORD_RESET",
-      usedAt: null,
-      expiresAt: { $gt: new Date() },
+    const record = await prisma.verificationToken.findFirst({
+      where: {
+        tokenHash,
+        purpose: "PASSWORD_RESET",
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
     });
 
     if (!record) {
@@ -39,20 +37,25 @@ export async function POST(request: Request) {
 
     const passwordHash = await hash(parsed.data.password, 12);
 
-    await User.findByIdAndUpdate(record.userId, {
-      passwordHash,
-      failedLoginAttempts: 0,
-      lockedUntil: null,
+    await prisma.user.update({
+      where: { id: record.userId },
+      data: {
+        passwordHash,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
     });
 
-    record.usedAt = new Date();
-    await record.save();
+    await prisma.verificationToken.update({
+      where: { id: record.id },
+      data: { usedAt: new Date() },
+    });
 
     await recordAudit({
       actorId: record.userId,
       action: "PASSWORD_RESET",
       targetType: "User",
-      targetId: record.userId.toString(),
+      targetId: record.userId,
       request,
     });
 

@@ -2,13 +2,8 @@ import { InlineKeyboard } from "grammy";
 import { createConversation } from "@grammyjs/conversations";
 import type { Conversation } from "@grammyjs/conversations";
 
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
-import { Wallet } from "@/models/Wallet";
-import { Order } from "@/models/Order";
-import { Category } from "@/models/Category";
-import { Service } from "@/models/Service";
-import type { PaymentMethod } from "@/models/Payment";
+import { prisma } from "@/lib/db";
+import type { PaymentMethod, User } from "@/lib/generated/prisma";
 import { formatMoney } from "@/lib/money";
 import { escapeHtml } from "@/lib/telegram/format";
 import { getBot } from "@/lib/telegram/client";
@@ -28,10 +23,9 @@ import type { BotContext } from "@/lib/telegram/types";
 let registered = false;
 
 /** Loads the linked panel user for the current Telegram chat, or null if unlinked. */
-async function getLinkedUser(ctx: BotContext) {
+async function getLinkedUser(ctx: BotContext): Promise<User | null> {
   const telegramId = String(ctx.from!.id);
-  await connectDB();
-  return User.findOne({ telegramId });
+  return prisma.user.findUnique({ where: { telegramId } });
 }
 
 function requireLinked<T extends BotContext>(handler: (ctx: T, user: NonNullable<Awaited<ReturnType<typeof getLinkedUser>>>) => Promise<void>) {
@@ -81,17 +75,16 @@ async function sendMainMenu(ctx: BotContext, greeting?: string) {
 async function orderConversation(conversation: Conversation<BotContext, BotContext>, ctx: BotContext) {
   // IMPORTANT: `conversation.external()` results are JSON-serialized by the
   // conversations plugin so the conversation can be replayed deterministically
-  // across restarts. Mongoose ObjectId/Decimal128 instances survive the FIRST
-  // pass looking fine (still live objects), but silently turn into plain
-  // strings on REPLAY — causing subtle bugs like `.toString()` on a value
-  // that's already a string, or a raw ObjectId leaking into a Mongoose query
-  // as `"[object Object]"`. To avoid this entirely, every `external()` call
-  // below returns fully plain, pre-serialized (string/number/boolean) data —
-  // never a Mongoose document, subdocument, ObjectId, or Decimal128.
+  // across restarts. Prisma's `Decimal` instances survive the FIRST pass
+  // looking fine (still live objects), but silently turn into plain
+  // strings on REPLAY — causing subtle bugs like calling a Decimal method
+  // on a value that's already a plain string. To avoid this entirely, every
+  // `external()` call below returns fully plain, pre-serialized
+  // (string/number/boolean) data — never a Prisma model instance or Decimal.
   const user = await conversation.external(async () => {
     const u = await getLinkedUser(ctx);
     if (!u) return null;
-    return { id: u._id.toString(), status: u.status as string };
+    return { id: u.id, status: u.status as string };
   });
 
   if (!user) {
@@ -100,8 +93,8 @@ async function orderConversation(conversation: Conversation<BotContext, BotConte
   }
 
   const categories = await conversation.external(async () => {
-    const docs = await Category.find({ active: true }).sort({ sortOrder: 1 }).lean();
-    return docs.map((c) => ({ id: c._id.toString(), name: c.name }));
+    const docs = await prisma.category.findMany({ where: { active: true }, orderBy: { sortOrder: "asc" } });
+    return docs.map((c) => ({ id: c.id, name: c.name }));
   });
 
   if (categories.length === 0) {
@@ -121,9 +114,9 @@ async function orderConversation(conversation: Conversation<BotContext, BotConte
   const categoryId = catCtx.callbackQuery.data.split(":")[1];
 
   const services = await conversation.external(async () => {
-    const docs = await Service.find({ categoryId, active: true, hidden: false }).lean();
+    const docs = await prisma.service.findMany({ where: { categoryId, active: true, hidden: false } });
     return docs.map((s) => ({
-      id: s._id.toString(),
+      id: s.id,
       name: s.name,
       rate: s.rate.toString(),
       minQuantity: s.minQuantity,
@@ -191,11 +184,11 @@ async function orderConversation(conversation: Conversation<BotContext, BotConte
         });
         // Return plain data + fire the admin notification here (still inside
         // `external`, so it isn't re-run on replay) rather than passing the
-        // Mongoose document back out to the conversation body.
+        // Prisma model instance back out to the conversation body.
         await notifyOrderPlaced(order);
         return {
           ok: true as const,
-          orderId: order._id.toString(),
+          orderId: order.id,
           charge: order.charge.toString(),
         };
       } catch (err) {
@@ -227,7 +220,7 @@ async function depositConversation(conversation: Conversation<BotContext, BotCon
   // returned from `conversation.external()` must be plain/JSON-safe.
   const user = await conversation.external(async () => {
     const u = await getLinkedUser(ctx);
-    return u ? { id: u._id.toString() } : null;
+    return u ? { id: u.id } : null;
   });
 
   if (!user) {
@@ -256,7 +249,7 @@ async function depositConversation(conversation: Conversation<BotContext, BotCon
     return;
   }
 
-  await ctx.reply("Enter your transaction reference / TrxID:");
+  await ctx.reply("Enter the transaction reference/ID for this deposit:");
   const refCtx = await conversation.waitFor(":text");
   const transactionRef = refCtx.msg.text.trim();
 
@@ -293,7 +286,7 @@ async function depositConversation(conversation: Conversation<BotContext, BotCon
 async function supportConversation(conversation: Conversation<BotContext, BotContext>, ctx: BotContext) {
   const user = await conversation.external(async () => {
     const u = await getLinkedUser(ctx);
-    return u ? { id: u._id.toString() } : null;
+    return u ? { id: u.id } : null;
   });
 
   if (!user) {
@@ -313,7 +306,7 @@ async function supportConversation(conversation: Conversation<BotContext, BotCon
     const ticketId = await conversation.external(async () => {
       const ticket = await createTicket({ userId: user.id, subject, priority: "MEDIUM", message });
       await notifyAdminNewTicket(ticket);
-      return ticket._id.toString();
+      return ticket.id;
     });
 
     await ctx.reply(`✅ Support ticket created!\nTicket ID: <code>${ticketId}</code>`, {
@@ -383,8 +376,6 @@ export async function registerHandlers(): Promise<void> {
       return;
     }
 
-    await connectDB();
-
     try {
       const result = await linkTelegramAccount({
         code,
@@ -411,12 +402,12 @@ export async function registerHandlers(): Promise<void> {
   });
 
   bot.command("unlink", requireLinked(async (ctx, user) => {
-    await unlinkTelegramAccount(user._id.toString());
+    await unlinkTelegramAccount(user.id);
     await recordAudit({
-      actorId: user._id.toString(),
+      actorId: user.id,
       action: "TELEGRAM_UNLINKED",
       targetType: "User",
-      targetId: user._id.toString(),
+      targetId: user.id,
     });
     await ctx.reply("Your Telegram account has been unlinked.");
   }));
@@ -426,30 +417,28 @@ export async function registerHandlers(): Promise<void> {
   }));
 
   bot.command("balance", requireLinked(async (ctx, user) => {
-    await connectDB();
-    const wallet = await Wallet.findOne({ userId: user._id }).lean();
+    const wallet = await prisma.wallet.findUnique({ where: { userId: user.id } });
     await ctx.reply(`💳 Your balance: <b>${formatMoney(wallet?.balance ?? 0, wallet?.currency)}</b>`, {
       parse_mode: "HTML",
     });
   }));
 
   bot.command("orders", requireLinked(async (ctx, user) => {
-    await connectDB();
-    const orders = await Order.find({ userId: user._id })
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .populate("serviceId", "name")
-      .lean();
+    const orders = await prisma.order.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      include: { service: { select: { name: true } } },
+    });
 
     if (orders.length === 0) {
       await ctx.reply("You have no orders yet. Send /order to place one.");
       return;
     }
 
-    const lines = orders.map((o) => {
-      const service = o.serviceId as unknown as { name?: string } | null;
-      return `<code>${o._id.toString()}</code> — ${escapeHtml(service?.name ?? "Service")} — ${o.status} — ${formatMoney(o.charge)}`;
-    });
+    const lines = orders.map(
+      (o) => `<code>${o.id}</code> — ${escapeHtml(o.service?.name ?? "Service")} — ${o.status} — ${formatMoney(o.charge)}`
+    );
 
     await ctx.reply(`📦 <b>Your recent orders:</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
   }));
@@ -480,30 +469,28 @@ export async function registerHandlers(): Promise<void> {
   }));
   bot.callbackQuery("menu:balance", requireLinked(async (ctx, user) => {
     await ctx.answerCallbackQuery();
-    await connectDB();
-    const wallet = await Wallet.findOne({ userId: user._id }).lean();
+    const wallet = await prisma.wallet.findUnique({ where: { userId: user.id } });
     await ctx.reply(`💳 Your balance: <b>${formatMoney(wallet?.balance ?? 0, wallet?.currency)}</b>`, {
       parse_mode: "HTML",
     });
   }));
   bot.callbackQuery("menu:orders", requireLinked(async (ctx, user) => {
     await ctx.answerCallbackQuery();
-    await connectDB();
-    const orders = await Order.find({ userId: user._id })
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .populate("serviceId", "name")
-      .lean();
+    const orders = await prisma.order.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      include: { service: { select: { name: true } } },
+    });
 
     if (orders.length === 0) {
       await ctx.reply("You have no orders yet. Send /order to place one.");
       return;
     }
 
-    const lines = orders.map((o) => {
-      const service = o.serviceId as unknown as { name?: string } | null;
-      return `<code>${o._id.toString()}</code> — ${escapeHtml(service?.name ?? "Service")} — ${o.status} — ${formatMoney(o.charge)}`;
-    });
+    const lines = orders.map(
+      (o) => `<code>${o.id}</code> — ${escapeHtml(o.service?.name ?? "Service")} — ${o.status} — ${formatMoney(o.charge)}`
+    );
 
     await ctx.reply(`📦 <b>Your recent orders:</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
   }));
@@ -517,7 +504,7 @@ export async function registerHandlers(): Promise<void> {
 
     // Acknowledge the button press immediately. Telegram callback queries
     // expire ~15s after being sent, but the approval transaction below
-    // (Mongo connection + atomic wallet update) can occasionally take longer
+    // (DB round trip + atomic wallet update) can occasionally take longer
     // than that on a cold start — if we wait until after that work to call
     // `answerCallbackQuery`, Telegram rejects it with "query is too old" even
     // though the underlying approval succeeded. Ack now with a lightweight
@@ -527,15 +514,14 @@ export async function registerHandlers(): Promise<void> {
       logger.error({ err }, "[telegram bot] failed to ack callback query");
     });
 
-    await connectDB();
     const [, action, paymentId] = ctx.callbackQuery.data.split(":");
 
     // The bot admin chat has no linked panel "reviewer" user id in general,
     // so we fall back to a well-known system marker. If the admin has ALSO
     // linked their own panel account to this same chat, prefer their id for
     // accurate audit trail attribution.
-    const reviewer = await User.findOne({ telegramId: String(ctx.from!.id) });
-    const reviewerId = reviewer?._id.toString();
+    const reviewer = await prisma.user.findUnique({ where: { telegramId: String(ctx.from!.id) } });
+    const reviewerId = reviewer?.id;
 
     if (!reviewerId) {
       await ctx.reply("Link your admin panel account first (/link) to approve/reject from the bot.");
@@ -556,7 +542,7 @@ export async function registerHandlers(): Promise<void> {
         await ctx.editMessageText(`${ctx.callbackQuery.message?.text}\n\n✅ Approved by ${escapeHtml(reviewer!.name)}`, {
           parse_mode: "HTML",
         });
-        await notifyUserDepositReviewed(payment.userId.toString(), true, formatMoney(payment.amount, payment.currency));
+        await notifyUserDepositReviewed(payment.userId, true, formatMoney(payment.amount, payment.currency));
       } else {
         const payment = await rejectDeposit(paymentId, reviewerId);
         await recordAudit({
@@ -570,7 +556,7 @@ export async function registerHandlers(): Promise<void> {
         await ctx.editMessageText(`${ctx.callbackQuery.message?.text}\n\n❌ Rejected by ${escapeHtml(reviewer!.name)}`, {
           parse_mode: "HTML",
         });
-        await notifyUserDepositReviewed(payment.userId.toString(), false, formatMoney(payment.amount, payment.currency));
+        await notifyUserDepositReviewed(payment.userId, false, formatMoney(payment.amount, payment.currency));
       }
     } catch (err) {
       const message = err instanceof AppError ? err.message : "Failed to process this action.";

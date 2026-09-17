@@ -1,7 +1,6 @@
 import { getLocale, getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Order } from "@/models/Order";
+import { prisma } from "@/lib/db";
 import { getDisplayMoneyBatch } from "@/lib/services/display-money";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { RefillButton } from "@/components/dashboard/refill-button";
@@ -9,19 +8,25 @@ import { OrderTimelineToggle } from "@/components/dashboard/order-timeline";
 import { isRefillEligible } from "@/lib/services/refill";
 import { Fragment } from "react";
 
+interface StatusHistoryEntry {
+  status: string;
+  note?: string | null;
+  at: string;
+}
+
 export default async function OrdersPage() {
   const session = await auth();
   const locale = await getLocale();
-  await connectDB();
   const t = await getTranslations("Dashboard.orders");
   const tStatus = await getTranslations("StatusBadge");
   const tRefillStatus = await getTranslations("RefillStatus");
 
-  const orders = await Order.find({ userId: session!.user.id })
-    .populate("serviceId", "name refillDays")
-    .sort({ createdAt: -1 })
-    .limit(50)
-    .lean();
+  const orders = await prisma.order.findMany({
+    where: { userId: session!.user.id },
+    include: { service: { select: { name: true, refillDays: true } } },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
 
   const chargeDisplays = await getDisplayMoneyBatch(
     orders.map((o) => o.charge),
@@ -54,24 +59,20 @@ export default async function OrdersPage() {
             </thead>
             <tbody className="divide-y divide-slate-800 bg-slate-950">
               {orders.map((order, i) => {
-                const service = order.serviceId as unknown as {
-                  name?: string;
-                  refillDays?: number | null;
-                } | null;
-
-                const refillDays = service?.refillDays ?? null;
+                const refillDays = order.service?.refillDays ?? null;
                 const charge = chargeDisplays[i];
                 // Orders created before the refillStatus field existed on the
-                // schema have it as undefined in the DB — Mongoose defaults only
-                // apply on document creation, not retroactively to old records
-                // fetched via .lean(). Treat missing as "NONE" defensively.
+                // schema have it as undefined in the DB — defaults only apply
+                // on row creation, not retroactively to old records. Treat
+                // missing as "NONE" defensively.
                 const refillStatus = order.refillStatus ?? "NONE";
                 const eligible = isRefillEligible({ ...order, refillStatus }, refillDays);
+                const statusHistory = (Array.isArray(order.statusHistory) ? order.statusHistory : []) as unknown as StatusHistoryEntry[];
 
                 return (
-                  <Fragment key={order._id.toString()}>
+                  <Fragment key={order.id}>
                     <tr>
-                      <td className="px-4 py-3 text-white">{service?.name || t("unknownService")}</td>
+                      <td className="px-4 py-3 text-white">{order.service?.name || t("unknownService")}</td>
                       <td className="max-w-[200px] truncate px-4 py-3 text-slate-300">{order.target}</td>
                       <td className="px-4 py-3 text-slate-300">{order.quantity}</td>
                       <td className="px-4 py-3 text-slate-300">
@@ -86,7 +87,7 @@ export default async function OrdersPage() {
                         {refillStatus !== "NONE" ? (
                           <span className="text-xs text-slate-500">{tRefillStatus(refillStatus)}</span>
                         ) : eligible ? (
-                          <RefillButton orderId={order._id.toString()} />
+                          <RefillButton orderId={order.id} />
                         ) : (
                           <span className="text-xs text-slate-600">—</span>
                         )}
@@ -96,10 +97,10 @@ export default async function OrdersPage() {
                     <tr>
                       <td colSpan={8} className="bg-slate-950 px-4 pb-3">
                         <OrderTimelineToggle
-                          events={(order.statusHistory ?? []).map((h) => ({
+                          events={statusHistory.map((h) => ({
                             status: h.status,
                             statusLabel: tStatus(h.status),
-                            note: h.note,
+                            note: h.note ?? null,
                             at: new Date(h.at).toISOString(),
                           }))}
                           toggleLabel={t("trackOrder")}

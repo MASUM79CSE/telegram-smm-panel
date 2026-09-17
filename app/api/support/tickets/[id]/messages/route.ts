@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 import { ticketMessageSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { notifyTicketReply } from "@/lib/telegram/notify";
@@ -24,7 +23,6 @@ export async function POST(
     return NextResponse.json({ error: "Too many messages sent. Please slow down." }, { status: 429 });
   }
 
-  await connectDB();
   const { id } = await params;
 
   const body = await request.json();
@@ -33,38 +31,40 @@ export async function POST(
     return NextResponse.json({ error: "Invalid message" }, { status: 400 });
   }
 
-  const ticket = await SupportTicket.findById(id);
-  if (!ticket) {
+  const existingTicket = await prisma.supportTicket.findUnique({ where: { id } });
+  if (!existingTicket) {
     return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
   }
 
   const isAdmin = session.user.role === "ADMIN";
-  const isOwner = ticket.userId.toString() === session.user.id;
+  const isOwner = existingTicket.userId === session.user.id;
 
   if (!isAdmin && !isOwner) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  if (ticket.status === "CLOSED") {
+  if (existingTicket.status === "CLOSED") {
     return NextResponse.json({ error: "This ticket is closed." }, { status: 400 });
   }
 
-  ticket.messages.push({
-    senderId: session.user.id,
-    message: parsed.data.message,
-    isAdmin,
-  } as never);
+  const ticket = await prisma.supportTicket.update({
+    where: { id },
+    data: {
+      status: isAdmin ? "ANSWERED" : "OPEN",
+      messages: {
+        create: [{ senderId: session.user.id, message: parsed.data.message, isAdmin }],
+      },
+    },
+    include: { messages: { orderBy: { createdAt: "asc" } } },
+  });
 
-  ticket.status = isAdmin ? "ANSWERED" : "OPEN";
-  await ticket.save();
-
-  notifyTicketReply(ticket.userId.toString(), id, ticket.subject, isAdmin).catch((err) =>
+  notifyTicketReply(ticket.userId, id, ticket.subject, isAdmin).catch((err) =>
     log.error({ err }, "Ticket-reply notification error")
   );
 
   if (isAdmin) {
     createNotification({
-      userId: ticket.userId.toString(),
+      userId: ticket.userId,
       type: "TICKET_REPLIED",
       title: "Support replied to your ticket",
       body: `New reply on "${ticket.subject}"`,

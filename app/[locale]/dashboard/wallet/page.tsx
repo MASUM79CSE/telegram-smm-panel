@@ -1,8 +1,6 @@
 import { getLocale, getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Wallet } from "@/models/Wallet";
-import { Transaction } from "@/models/Transaction";
+import { prisma } from "@/lib/db";
 import { getDisplayMoney, getDisplayMoneyBatch } from "@/lib/services/display-money";
 import { DualCurrency } from "@/components/shared/dual-currency";
 import { ATTRIBUTION_TEXT, ATTRIBUTION_URL } from "@/lib/currency-format";
@@ -11,12 +9,11 @@ import { DepositForm } from "@/components/dashboard/deposit-form";
 export default async function WalletPage() {
   const session = await auth();
   const locale = await getLocale();
-  await connectDB();
   const t = await getTranslations("Dashboard.wallet");
 
   const [wallet, transactions] = await Promise.all([
-    Wallet.findOne({ userId: session!.user.id }).lean(),
-    Transaction.find({ userId: session!.user.id }).sort({ createdAt: -1 }).limit(30).lean(),
+    prisma.wallet.findUnique({ where: { userId: session!.user.id } }),
+    prisma.transaction.findMany({ where: { userId: session!.user.id }, orderBy: { createdAt: "desc" }, take: 30 }),
   ]);
 
   const [balanceDisplay, transactionDisplays] = await Promise.all([
@@ -55,7 +52,7 @@ export default async function WalletPage() {
             {transactions.length === 0 && <p className="text-slate-400">{t("noTransactions")}</p>}
             {transactions.map((tx, i) => (
               <div
-                key={tx._id.toString()}
+                key={tx.id}
                 className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950 p-4"
               >
                 <div>

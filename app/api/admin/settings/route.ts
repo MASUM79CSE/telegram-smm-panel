@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Settings, getSettings } from "@/models/Settings";
+import { prisma } from "@/lib/db";
+import { getSettings } from "@/lib/services/settings";
 import { settingsSchema } from "@/lib/validation";
 import { recordAudit } from "@/lib/audit";
 
@@ -11,7 +11,6 @@ export async function GET() {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
   const settings = await getSettings();
   return NextResponse.json({ settings });
 }
@@ -22,15 +21,17 @@ export async function PATCH(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const body = await request.json();
   const parsed = settingsSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid data", details: parsed.error.flatten().fieldErrors }, { status: 400 });
   }
 
-  const settings = await Settings.findOneAndUpdate({ key: "global" }, parsed.data, { new: true, upsert: true });
+  const settings = await prisma.settings.upsert({
+    where: { key: "global" },
+    create: { key: "global", ...parsed.data },
+    update: parsed.data,
+  });
 
   await recordAudit({
     actorId: session.user.id,

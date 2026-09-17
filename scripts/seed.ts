@@ -16,8 +16,8 @@
  * script remain in the database until an admin edits or deletes them from
  * the admin panel, they are not touched by this script.)
  *
- * Idempotent: guarded by a `findOne` check, safe to run repeatedly (e.g. on
- * every deploy) without creating a duplicate admin account.
+ * Idempotent: guarded by a `findUnique` check, safe to run repeatedly (e.g.
+ * on every deploy) without creating a duplicate admin account.
  *
  * Usage: npm run seed
  */
@@ -25,30 +25,28 @@ import { config } from "dotenv";
 config({ path: ".env.local" });
 config();
 import { hash } from "bcryptjs";
-import { connectDB } from "../lib/db";
-import { User } from "../models/User";
-import { Wallet } from "../models/Wallet";
-import { getSettings } from "../models/Settings";
+import { prisma } from "../lib/db";
+import { getSettings } from "../lib/services/settings";
+import { toDecimal128 } from "../lib/money";
 
 async function main() {
-  await connectDB();
-  console.log("Connected to database.");
-
   const adminEmail = (process.env.SEED_ADMIN_EMAIL || "admin@example.com").toLowerCase();
   const adminPassword = process.env.SEED_ADMIN_PASSWORD || "ChangeMe123!";
 
-  let admin = await User.findOne({ email: adminEmail });
+  let admin = await prisma.user.findUnique({ where: { email: adminEmail } });
   if (!admin) {
     const passwordHash = await hash(adminPassword, 12);
-    admin = await User.create({
-      name: "Administrator",
-      email: adminEmail,
-      passwordHash,
-      role: "ADMIN",
-      status: "ACTIVE",
-      emailVerified: new Date(),
+    admin = await prisma.user.create({
+      data: {
+        name: "Administrator",
+        email: adminEmail,
+        passwordHash,
+        role: "ADMIN",
+        status: "ACTIVE",
+        emailVerified: new Date(),
+      },
     });
-    await Wallet.create({ userId: admin._id, balance: 0 });
+    await prisma.wallet.create({ data: { userId: admin.id, balance: toDecimal128("0") } });
     console.log(`✅ Created admin account: ${adminEmail} / ${adminPassword}`);
     console.log(`⚠️  CHANGE THIS PASSWORD IMMEDIATELY AFTER FIRST LOGIN.`);
   } else {

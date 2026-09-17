@@ -1,0 +1,735 @@
+// SMM Panel — Prisma schema (PostgreSQL / Supabase)
+//
+// This is the Postgres/Prisma equivalent of the original MongoDB/Mongoose
+// model set (see git history / MEMORY.md for the migration rationale).
+// Notable translation decisions, documented once here rather than repeated
+// per-model:
+//
+// - IDs: `String @id @default(uuid())` everywhere (Postgres has no native
+//   ObjectId). All foreign keys are plain `String` columns referencing
+//   another model's `id`, enforced by real Postgres foreign-key
+//   constraints — stronger than Mongoose's `ref` (which is unenforced at
+//   the DB level).
+// - Money: Prisma `Decimal` (`@db.Decimal(18, 4)`), matching the original
+//   4-decimal-place fixed-point convention from `lib/money.ts` — exact,
+//   no floating-point drift, same as Mongo's `Decimal128` usage before.
+// - "Sparse unique" fields (`User.telegramId`, `Transaction.idempotencyKey`,
+//   `Payment.transactionRef`): MongoDB's sparse-index workaround
+//   (documented at length in the original models — see MEMORY.md §4/§7 for
+//   the production incident that motivated it) is no longer needed at all.
+//   Postgres unique constraints natively treat every NULL as distinct, so
+//   any number of rows can have a NULL value in a `@unique` column — this
+//   is simpler and strictly safer than the Mongo equivalent.
+// - Embedded arrays of subdocuments (`Order.statusHistory`,
+//   `SupportTicket.messages`) become either a `Json` column (for small,
+//   display-only, never-independently-queried history like
+//   `statusHistory`) or a proper related table with a foreign key (for
+//   `SupportTicket.messages`, which benefits from being independently
+//   queryable/insertable rows). See each model's own comment.
+// - `Schema.Types.Mixed` fields (`AuditLog.metadata`, `Payment.gatewayPayload`,
+//   `Order.providerResponse`, `ExchangeRateCache.rates`) become `Json`.
+// - MongoDB TTL index (`VerificationToken`, auto-delete after `expiresAt`):
+//   Postgres has no native TTL. See `scripts/cleanup-expired-tokens.ts`
+//   (new, added as part of this migration) — run it on a schedule (the
+//   existing GitHub Actions cron infrastructure) to delete expired rows;
+//   until then, expired-but-unused tokens simply sit inert (already
+//   unusable — `expiresAt` is checked on every read — just not physically
+//   deleted).
+// - Singleton "one row" collections (`Settings`, `ExchangeRateCache`) keep
+//   the same single-row-by-known-key convention, enforced via a unique
+//   `key` column exactly as before.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // Supabase: use the pooled "Transaction" connection string (port 6543,
+  // ?pgbouncer=true) for DATABASE_URL (used by the app at request time —
+  // serverless needs pooling, not a direct connection per invocation), and
+  // the direct connection (port 5432) for DIRECT_URL (used only by
+  // `prisma migrate` at deploy/build time, which needs a real, non-pooled
+  // connection to run DDL and advisory locks). See docs/DATABASE.md.
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum ProviderType {
+  API
+  MANUAL
+  INTERNAL
+}
+
+enum ProviderStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum ServiceType {
+  DEFAULT
+  CUSTOM_COMMENTS
+  MENTIONS
+  SUBSCRIPTIONS
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  IN_PROGRESS
+  COMPLETED
+  PARTIAL
+  CANCELED
+  FAILED
+  REFUNDED
+}
+
+enum RefillStatus {
+  NONE
+  REQUESTED
+  COMPLETED
+  REJECTED
+}
+
+enum PaymentMethod {
+  BKASH
+  NAGAD
+  SSLCOMMERZ
+  MANUAL
+  CRYPTO
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELED
+  REJECTED
+}
+
+enum TransactionType {
+  DEPOSIT
+  ORDER_PAYMENT
+  ORDER_REFUND
+  ADJUSTMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELED
+}
+
+enum TicketStatus {
+  OPEN
+  ANSWERED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum TokenPurpose {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+  TELEGRAM_LINK
+}
+
+enum NotificationType {
+  ORDER_PLACED
+  ORDER_STATUS_CHANGED
+  ORDER_REFILL_RESOLVED
+  DEPOSIT_SUBMITTED
+  DEPOSIT_APPROVED
+  DEPOSIT_REJECTED
+  TICKET_CREATED
+  TICKET_REPLIED
+  NEW_ORDER
+  NEW_DEPOSIT
+  NEW_TICKET
+}
+
+enum AuditAction {
+  USER_ROLE_CHANGE
+  USER_STATUS_CHANGE
+  PAYMENT_APPROVED
+  PAYMENT_REJECTED
+  ORDER_STATUS_CHANGE
+  ORDER_REFUNDED
+  SERVICE_CREATED
+  SERVICE_UPDATED
+  SERVICE_DELETED
+  CATEGORY_CREATED
+  CATEGORY_UPDATED
+  CATEGORY_DELETED
+  SERVICE_GROUP_CREATED
+  SERVICE_GROUP_UPDATED
+  SERVICE_GROUP_DELETED
+  PROVIDER_CREATED
+  PROVIDER_UPDATED
+  PROVIDER_DELETED
+  SERVICE_PROVIDER_LINK_CREATED
+  SERVICE_PROVIDER_LINK_UPDATED
+  SERVICE_PROVIDER_LINK_DELETED
+  SERVICE_PROVIDER_BACKFILL_RUN
+  API_KEY_CREATED
+  API_KEY_REVOKED
+  ORDER_REFILL_REQUESTED
+  ORDER_REFILL_RESOLVED
+  ORDER_PARTIAL_REFUND_ISSUED
+  SETTINGS_UPDATED
+  WALLET_ADJUSTMENT
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  PASSWORD_RESET
+  TELEGRAM_LINKED
+  TELEGRAM_UNLINKED
+  TELEGRAM_BOT_ORDER_PLACED
+  TELEGRAM_BOT_DEPOSIT_SUBMITTED
+  TELEGRAM_BOT_ADMIN_ACTION
+  ACCOUNT_UPDATED
+  PASSWORD_CHANGED_BY_USER
+  FAVORITE_SERVICE_ADDED
+  FAVORITE_SERVICE_REMOVED
+  DATA_EXPORTED
+  ORDER_BULK_STATUS_CHANGE
+}
+
+// =============================================================================
+// Core identity & wallet
+// =============================================================================
+
+model User {
+  id           String     @id @default(uuid())
+  name         String
+  email        String     @unique
+  passwordHash String?
+  role         UserRole   @default(USER)
+  status       UserStatus @default(ACTIVE)
+
+  emailVerified DateTime?
+
+  // Telegram linking. No sparse-index workaround needed (see file header) —
+  // Postgres allows unlimited NULLs in a @unique column natively.
+  telegramId       String? @unique
+  telegramUsername String?
+
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  twoFactorEnabled    Boolean   @default(false)
+  twoFactorSecret     String?
+
+  lastLoginAt DateTime?
+  lastLoginIp String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  wallet             Wallet?
+  transactions       Transaction[]
+  orders             Order[]
+  payments           Payment[]              @relation("PaymentUser")
+  reviewedPayments   Payment[]              @relation("PaymentReviewer")
+  supportTickets     SupportTicket[]
+  ticketMessages     TicketMessage[]
+  auditLogsAsActor   AuditLog[]
+  verificationTokens VerificationToken[]
+  apiKeys            ApiKey[]
+  notifications      Notification[]
+  favoriteServices   FavoriteService[]
+
+  @@index([role])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+}
+
+model Wallet {
+  id      String @id @default(uuid())
+  userId  String @unique
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  balance  Decimal @db.Decimal(18, 4)
+  currency String  @default("USD")
+
+  /// Optimistic-concurrency guard, incremented on every balance mutation —
+  /// same role as the original Mongoose `Wallet.version` field. Combined
+  /// with a Postgres transaction (`prisma.$transaction`) + a conditional
+  /// `UPDATE ... WHERE version = $current` (translated 1:1 from the
+  /// original `Wallet.updateOne({ _id, version }, ...)` pattern), this is
+  /// still the load-bearing correctness mechanism preventing double-spend
+  /// under concurrent order placement. See lib/services/orders.ts.
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+}
+
+model Transaction {
+  id       String @id @default(uuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId String
+  wallet   Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  type   TransactionType
+  status TransactionStatus @default(COMPLETED)
+
+  amount        Decimal @db.Decimal(18, 4)
+  balanceBefore Decimal @db.Decimal(18, 4)
+  balanceAfter  Decimal @db.Decimal(18, 4)
+
+  description String?
+
+  relatedOrderId   String?
+  order            Order?   @relation(fields: [relatedOrderId], references: [id])
+  relatedPaymentId String?
+  payment          Payment? @relation(fields: [relatedPaymentId], references: [id])
+
+  /// Idempotency key so a retried webhook/request never double-applies.
+  /// No `@default` — mirrors the original Mongo "must be truly absent, not
+  /// explicit null" caution, though in Postgres this distinction no longer
+  /// matters (see file header): NULL is NULL, always excluded from the
+  /// unique constraint regardless of how it got there.
+  idempotencyKey String? @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// Catalog: ServiceGroup -> Category -> Service, plus Provider/ServiceProvider
+// =============================================================================
+
+model ServiceGroup {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  slug      String   @unique
+  icon      String?
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  categories Category[]
+
+  @@index([active])
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+
+  groupId String?
+  group   ServiceGroup? @relation(fields: [groupId], references: [id])
+
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  services Service[]
+
+  @@index([groupId])
+  @@index([active])
+}
+
+model Provider {
+  id     String         @id @default(uuid())
+  name   String         @unique
+  type   ProviderType
+  status ProviderStatus @default(ACTIVE)
+
+  apiUrl String?
+  /// Encrypted at rest — see lib/crypto.ts. Never returned in API responses
+  /// (application-layer concern; Prisma has no column-level `select:false`
+  /// equivalent, so every service function reading a Provider must
+  /// explicitly `select` only the fields a given caller needs, exactly as
+  /// documented in each service file).
+  apiKeyEncrypted String?
+
+  balance           String?
+  lastBalanceSyncAt DateTime?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  services         Service[]
+  serviceProviders ServiceProvider[]
+  orders           Order[]
+
+  @@index([status])
+}
+
+model Service {
+  id         String  @id @default(uuid())
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  name        String
+  description String?
+  type        ServiceType @default(DEFAULT)
+
+  /// Price charged to the customer per 1000 units.
+  rate Decimal @db.Decimal(18, 4)
+
+  /// Legacy single-provider fields — kept for zero-migration compatibility
+  /// with services not yet backfilled into ServiceProvider (see that
+  /// model's comment). lib/fulfillment.ts prefers ServiceProvider rows.
+  providerId         String?
+  provider           Provider? @relation(fields: [providerId], references: [id])
+  providerServiceId  String?
+  providerRate       Decimal?  @db.Decimal(18, 4)
+
+  minQuantity Int
+  maxQuantity Int
+
+  active Boolean @default(true)
+  hidden Boolean @default(false)
+
+  refillDays               Int?
+  estimatedDeliveryMinutes Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  serviceProviders ServiceProvider[]
+  orders           Order[]
+  favoritedBy      FavoriteService[]
+
+  @@index([categoryId, active])
+}
+
+/// Explicit join table replacing Mongoose's `favoriteServiceIds` array on
+/// `User` — Postgres relations are modeled as real join rows rather than an
+/// array-of-ids column, which also gets us a natural place to add a
+/// per-favorite timestamp later if ever needed (the original array
+/// deliberately didn't have one; this loses nothing and gains normalcy).
+model FavoriteService {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceId String
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, serviceId])
+}
+
+/// Links a customer-facing Service to one or more upstream Providers with a
+/// priority order for automatic failover. See original model's extensive
+/// comment (preserved in git history / docs/DATABASE.md) for full
+/// rationale — unchanged by this migration.
+model ServiceProvider {
+  id                String  @id @default(uuid())
+  serviceId         String
+  service           Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  providerId        String
+  provider          Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  providerServiceId String
+  providerRate      Decimal  @db.Decimal(18, 4)
+  /// Lower priority number = tried first during dispatch fallback.
+  priority Int     @default(0)
+  active   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([serviceId, providerId])
+  @@index([serviceId, active, priority])
+}
+
+// =============================================================================
+// Orders & fulfillment
+// =============================================================================
+
+model Order {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  serviceId  String
+  service    Service   @relation(fields: [serviceId], references: [id])
+  providerId String?
+  provider   Provider? @relation(fields: [providerId], references: [id])
+
+  target      String
+  quantity    Int
+  startCount  Int?
+  remains     Int?
+
+  charge Decimal @db.Decimal(18, 4)
+
+  status OrderStatus @default(PENDING)
+  /// Small, display-only, append-only history — never independently
+  /// queried/filtered, so a Json column is the right translation of the
+  /// original embedded-subdocument array (see file header).
+  statusHistory Json @default("[]")
+
+  providerOrderId  String?
+  /// Arbitrary raw provider API response, for debugging — was
+  /// `Schema.Types.Mixed` in Mongoose.
+  providerResponse Json?
+
+  attempts      Int       @default(0)
+  lastAttemptAt DateTime?
+  lastError     String?
+
+  completedAt       DateTime?
+  refillStatus       RefillStatus @default(NONE)
+  refillRequestedAt DateTime?
+  providerRefillId  String?
+
+  partialRefundIssuedAt DateTime?
+  lastStatusCheckAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@index([status, lastStatusCheckAt])
+  @@index([providerOrderId])
+}
+
+// =============================================================================
+// Payments (deposits)
+// =============================================================================
+
+model Payment {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation("PaymentUser", fields: [userId], references: [id])
+
+  amount   Decimal @db.Decimal(18, 4)
+  currency String  @default("BDT")
+
+  method         PaymentMethod
+  transactionRef String?       @unique
+
+  status PaymentStatus @default(PENDING)
+
+  /// Raw gateway webhook/callback payload, for audit/debugging.
+  gatewayPayload Json?
+
+  reviewedBy       String?
+  reviewer         User?     @relation("PaymentReviewer", fields: [reviewedBy], references: [id])
+  reviewedAt       DateTime?
+  rejectionReason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+// =============================================================================
+// Support tickets
+// =============================================================================
+
+model SupportTicket {
+  id       String         @id @default(uuid())
+  userId   String
+  user     User           @relation(fields: [userId], references: [id])
+  subject  String
+  status   TicketStatus   @default(OPEN)
+  priority TicketPriority @default(MEDIUM)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages TicketMessage[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+  @@index([status])
+}
+
+/// Was an embedded subdocument array (`SupportTicket.messages`) in
+/// Mongoose. Promoted to a real related table — messages benefit from
+/// being independently insertable rows (an `INSERT` instead of rewriting
+/// the whole parent array) and this is the more idiomatic relational shape
+/// for a comment/message thread.
+model TicketMessage {
+  id       String        @id @default(uuid())
+  ticketId String
+  ticket   SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId String
+  sender   User          @relation(fields: [senderId], references: [id])
+  message  String
+  isAdmin  Boolean       @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+// =============================================================================
+// Audit log (immutable)
+// =============================================================================
+
+model AuditLog {
+  id      String       @id @default(uuid())
+  actorId String?
+  actor   User?        @relation(fields: [actorId], references: [id])
+
+  actorEmail String?
+  action     AuditAction
+  targetType String?
+  targetId   String?
+  /// Was `Schema.Types.Mixed` in Mongoose.
+  metadata   Json?
+  ip         String?
+  userAgent  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([targetId])
+  @@index([createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// Verification tokens (email verify / password reset / Telegram link)
+// =============================================================================
+
+model VerificationToken {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 hash of the raw token — the raw token is only ever emailed,
+  /// never stored, exactly as before.
+  tokenHash String       @unique
+  purpose   TokenPurpose
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  /// No native TTL in Postgres (see file header) — expired rows are
+  /// treated as unusable by application logic (checked on every read,
+  /// same as before) and physically deleted on a schedule by
+  /// scripts/cleanup-expired-tokens.ts instead of automatically by the DB.
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// Reseller API keys
+// =============================================================================
+
+model ApiKey {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 hash of the raw key — the raw key is shown once at creation
+  /// and is unrecoverable after that, exactly as before.
+  keyHash    String   @unique
+  keyPrefix  String
+  label      String?
+  lastUsedAt DateTime?
+  active     Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([active])
+}
+
+// =============================================================================
+// In-app notifications
+// =============================================================================
+
+model Notification {
+  id     String           @id @default(uuid())
+  userId String
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   NotificationType
+  title  String
+  body   String
+  /// Relative path to navigate to when clicked, e.g. "/dashboard/orders".
+  href String?
+  read Boolean @default(false)
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, read, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// Singletons: Settings, ExchangeRateCache
+// =============================================================================
+
+model Settings {
+  /// Single-row table, exactly as the original Mongoose singleton
+  /// (`key: "global"` unique). Enforced the same way here.
+  key                 String  @id @default("global")
+  siteName            String  @default("SMM Panel")
+  siteDescription     String?
+  supportEmail        String?
+  minDeposit          Decimal @default(1) @db.Decimal(18, 4)
+  maxDeposit          Decimal @default(100000) @db.Decimal(18, 4)
+  registrationEnabled Boolean @default(true)
+  maintenanceMode     Boolean @default(false)
+
+  updatedAt DateTime @updatedAt
+}
+
+model ExchangeRateCache {
+  /// Single-row table (see Settings above for the same convention).
+  key  String @id @default("latest")
+  base String @default("USD")
+  /// ISO 4217 code -> rate. Was `Schema.Types.Mixed` in Mongoose.
+  rates                Json
+  fetchedAt            DateTime
+  upstreamNextUpdateAt DateTime?
+}
+
+/// grammY session storage for the Telegram bot's stateful conversations
+/// (e.g. the multi-step `/support` flow) — was `@grammyjs/storage-mongodb`
+/// backed by the shared Mongoose connection's native driver handle before
+/// this migration. `lib/telegram/client.ts` implements a small custom
+/// grammY `StorageAdapter` directly against this table via Prisma (no
+/// equivalent `@grammyjs/storage-prisma` package exists), since a session
+/// key/value store this simple doesn't need its own dedicated Redis-like
+/// infra — the same DB the rest of the app already uses is sufficient.
+model TelegramBotSession {
+  /// grammY's own session key (typically the chat id as a string).
+  key       String   @id
+  /// Arbitrary session payload — shape is owned by lib/telegram/types.ts's
+  /// `SessionData`, not by this schema.
+  data      Json
+  updatedAt DateTime @updatedAt
+}

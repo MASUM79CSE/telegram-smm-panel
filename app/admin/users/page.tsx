@@ -1,10 +1,10 @@
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { UsersTable } from "@/components/admin/users-table";
 import { AdminFilterBar } from "@/components/admin/admin-filter-bar";
 import { AdminPagination } from "@/components/admin/admin-pagination";
-import { parseListQuery, escapeRegExp } from "@/lib/admin-query";
+import { parseListQuery } from "@/lib/admin-query";
+import type { Prisma, UserStatus } from "@/lib/generated/prisma";
 
 const USER_STATUS_OPTIONS = ["ACTIVE", "SUSPENDED", "BANNED"];
 
@@ -14,7 +14,6 @@ export default async function AdminUsersPage({
   searchParams: Promise<Record<string, string | undefined>>;
 }) {
   const session = await auth();
-  await connectDB();
 
   const resolvedSearchParams = await searchParams;
   const urlSearchParams = new URLSearchParams(
@@ -22,26 +21,29 @@ export default async function AdminUsersPage({
   );
   const { page, limit, status, search, dateRange } = parseListQuery(urlSearchParams);
 
-  const filter: Record<string, unknown> = {};
-  if (status && status.length > 0) filter.status = { $in: status };
-  if (dateRange) filter.createdAt = dateRange;
+  const where: Prisma.UserWhereInput = {};
+  if (status && status.length > 0) where.status = { in: status as UserStatus[] };
+  if (dateRange) where.createdAt = dateRange;
   if (search) {
-    const re = { $regex: escapeRegExp(search), $options: "i" };
-    filter.$or = [{ name: re }, { email: re }];
+    where.OR = [
+      { name: { contains: search, mode: "insensitive" } },
+      { email: { contains: search, mode: "insensitive" } },
+    ];
   }
 
   const [users, total] = await Promise.all([
-    User.find(filter)
-      .select("-passwordHash -twoFactorSecret")
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    User.countDocuments(filter),
+    prisma.user.findMany({
+      where,
+      omit: { passwordHash: true, twoFactorSecret: true },
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.user.count({ where }),
   ]);
 
   const rows = users.map((u) => ({
-    _id: u._id.toString(),
+    _id: u.id,
     name: u.name,
     email: u.email,
     role: u.role,

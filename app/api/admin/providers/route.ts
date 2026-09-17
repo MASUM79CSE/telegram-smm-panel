@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { Provider } from "@/models/Provider";
+import { prisma } from "@/lib/db";
 import { providerSchema } from "@/lib/validation";
 import { encryptSecret } from "@/lib/crypto";
 import { recordAudit } from "@/lib/audit";
@@ -12,9 +11,11 @@ export async function GET() {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-  // apiKeyEncrypted has select:false on the schema, so it's never returned here.
-  const providers = await Provider.find().sort({ createdAt: -1 }).lean();
+  // apiKeyEncrypted is omitted here — never returned to the admin list view.
+  const providers = await prisma.provider.findMany({
+    orderBy: { createdAt: "desc" },
+    omit: { apiKeyEncrypted: true },
+  });
   return NextResponse.json({ providers });
 }
 
@@ -24,8 +25,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  await connectDB();
-
   const body = await request.json();
   const parsed = providerSchema.safeParse(body);
   if (!parsed.success) {
@@ -34,9 +33,12 @@ export async function POST(request: Request) {
 
   const { apiKey, ...rest } = parsed.data;
 
-  const provider = await Provider.create({
-    ...rest,
-    apiKeyEncrypted: apiKey ? encryptSecret(apiKey) : null,
+  const provider = await prisma.provider.create({
+    data: {
+      ...rest,
+      apiKeyEncrypted: apiKey ? encryptSecret(apiKey) : null,
+    },
+    omit: { apiKeyEncrypted: true },
   });
 
   await recordAudit({
@@ -44,13 +46,9 @@ export async function POST(request: Request) {
     actorEmail: session.user.email,
     action: "PROVIDER_CREATED",
     targetType: "Provider",
-    targetId: provider._id.toString(),
+    targetId: provider.id,
     request,
   });
 
-  // Strip sensitive field defensively even though select:false already hides it.
-  const safe = provider.toObject();
-  delete (safe as { apiKeyEncrypted?: unknown }).apiKeyEncrypted;
-
-  return NextResponse.json({ message: "Provider created", provider: safe }, { status: 201 });
+  return NextResponse.json({ message: "Provider created", provider }, { status: 201 });
 }

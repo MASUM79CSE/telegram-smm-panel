@@ -1,21 +1,19 @@
 import { getTranslations } from "next-intl/server";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { SupportTicket } from "@/models/SupportTicket";
+import { prisma } from "@/lib/db";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { Link } from "@/i18n/navigation";
 import { Plus } from "lucide-react";
 
 export default async function SupportPage() {
   const session = await auth();
-  await connectDB();
   const t = await getTranslations("Dashboard.support");
   const tStatus = await getTranslations("StatusBadge");
 
-  const tickets = await SupportTicket.find({ userId: session!.user.id })
-    .select("-messages")
-    .sort({ updatedAt: -1 })
-    .lean();
+  const tickets = await prisma.supportTicket.findMany({
+    where: { userId: session!.user.id },
+    orderBy: { updatedAt: "desc" },
+  });
 
   return (
     <div>
@@ -40,8 +38,8 @@ export default async function SupportPage() {
         <div className="space-y-3">
           {tickets.map((ticket) => (
             <Link
-              key={ticket._id.toString()}
-              href={`/dashboard/support/${ticket._id}`}
+              key={ticket.id}
+              href={`/dashboard/support/${ticket.id}`}
               className="block rounded-xl border border-slate-800 bg-slate-950 p-5 hover:border-slate-700"
             >
               <div className="flex items-center justify-between">

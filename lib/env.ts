@@ -9,7 +9,21 @@ import { logger } from "@/lib/logger";
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
-  MONGODB_URI: z.string().min(1, "MONGODB_URI is required"),
+  /**
+   * Supabase/Postgres pooled ("Transaction mode", port 6543, `?pgbouncer=true`)
+   * connection string — used by the app at request time. See lib/db.ts and
+   * docs/DATABASE.md for why pooling specifically (not the direct
+   * connection) is required for a serverless deployment target.
+   */
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  /**
+   * Supabase/Postgres DIRECT (non-pooled, port 5432) connection string —
+   * used only by `prisma migrate`/`prisma db push` at deploy/build time,
+   * never at request time. Required because PgBouncer's transaction-pooling
+   * mode does not support the session-level features (advisory locks,
+   * prepared statements) Prisma Migrate needs to run DDL safely.
+   */
+  DIRECT_URL: z.string().min(1, "DIRECT_URL is required"),
 
   AUTH_SECRET: z
     .string()

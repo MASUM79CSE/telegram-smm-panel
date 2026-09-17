@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { ApiKey } from "@/models/ApiKey";
+import { prisma } from "@/lib/db";
 import { recordAudit } from "@/lib/audit";
 
 export async function DELETE(
@@ -14,20 +13,18 @@ export async function DELETE(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await connectDB();
   const { id } = await params;
 
-  // Scoped by BOTH _id and userId in one query — a user can only ever
+  // Scoped by BOTH id and userId in one query — a user can only ever
   // revoke their own key, never guess another user's key id and disable
   // it (this is the same "scope every mutation to the owning user, don't
   // rely on the id alone" discipline used throughout this project).
-  const apiKey = await ApiKey.findOneAndUpdate(
-    { _id: id, userId: session.user.id },
-    { $set: { active: false } },
-    { returnDocument: "after" }
-  );
+  const result = await prisma.apiKey.updateMany({
+    where: { id, userId: session.user.id },
+    data: { active: false },
+  });
 
-  if (!apiKey) {
+  if (result.count === 0) {
     return NextResponse.json({ error: "API key not found" }, { status: 404 });
   }
 

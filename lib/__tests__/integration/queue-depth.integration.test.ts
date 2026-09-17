@@ -1,46 +1,33 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
-import { Types } from "mongoose";
-import { Decimal128 } from "mongodb";
-import { startTestDb, stopTestDb, clearTestDb } from "./setup";
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { startTestDb, stopTestDb, clearTestDb, getTestClient } from "./setup";
+import { toDecimal128 } from "@/lib/money";
 
-/**
- * `checkQueueDepth` (like every function in lib/services/jobs.ts) calls
- * `connectDB()` itself, which reads `env.MONGODB_URI` (validated at import
- * time by lib/env.ts) and manages its own cached connection — the wrong
- * shape for this suite, which connects directly to the in-memory replica
- * set via `mongoose.connect()` in ./setup.ts instead (see that file's doc
- * comment for the full rationale, already established by the other
- * integration suites in this directory). Mocked to a no-op here so
- * `checkQueueDepth`'s queries run against the already-open test
- * connection rather than attempting a second, real-env-var-dependent one.
- */
-vi.mock("@/lib/db", () => ({
-  connectDB: vi.fn().mockResolvedValue(undefined),
-}));
-
-import {
-  checkQueueDepth,
-  STALE_PROCESSING_MINUTES,
-  PENDING_BACKLOG_ALERT_THRESHOLD,
-} from "@/lib/services/jobs";
-import { Order, type OrderStatus } from "@/models/Order";
+import { checkQueueDepth, STALE_PROCESSING_MINUTES, PENDING_BACKLOG_ALERT_THRESHOLD } from "@/lib/services/jobs";
+import type { PrismaClient, OrderStatus } from "@/lib/generated/prisma";
 
 /**
  * DB-backed integration coverage for `lib/services/jobs.ts#checkQueueDepth`
  * — closes the "order-processing queue depth" alerting gap flagged as
  * honestly open in `docs/PRODUCTION_READINESS.md` §6 (now implemented,
- * wired into `GET /api/cron/process-orders`, see that route).
+ * wired into `GET /api/cron/process-orders`, see that route). Postgres/
+ * Prisma edition.
  *
- * Uses a real MongoDB replica set (see ./setup.ts) rather than mocks
- * specifically to exercise the actual `Order.countDocuments` queries
- * (status + `updatedAt` comparisons) against real documents/indexes,
- * matching how `lib/__tests__/integration/orders.integration.test.ts`
- * already validates the transactional order-placement path for the same
- * reason.
+ * Uses a real local PostgreSQL database (see ./setup.ts) rather than mocks
+ * specifically to exercise the actual `prisma.order.count` queries
+ * (status + `updatedAt` comparisons) against real rows/indexes, matching
+ * how `lib/__tests__/integration/orders.integration.test.ts` already
+ * validates the transactional order-placement path for the same reason.
+ * Unlike the old Mongoose version, `@/lib/db` does NOT need to be mocked
+ * here: `lib/services/jobs.ts` calls the SAME lazily-constructed Prisma
+ * client this file's own `startTestDb()` uses (see setup.ts / lib/db.ts),
+ * so `checkQueueDepth()`'s queries naturally run against this suite's real
+ * test database — no second, divergent connection to reconcile.
  */
 describe("lib/services/jobs — checkQueueDepth (integration)", () => {
+  let db: PrismaClient;
+
   beforeAll(async () => {
-    await startTestDb();
+    db = await startTestDb();
   }, 60_000);
 
   afterAll(async () => {
@@ -51,24 +38,54 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
     await clearTestDb();
   });
 
-  async function createOrder(overrides: { status: OrderStatus; updatedAtMinutesAgo?: number }) {
-    const order = await Order.create({
-      userId: new Types.ObjectId(),
-      serviceId: new Types.ObjectId(),
-      target: "https://example.com/profile",
-      quantity: 100,
-      charge: Decimal128.fromString("1.00"),
-      status: overrides.status,
+  async function seedUserAndService() {
+    const user = await db.user.create({
+      data: {
+        name: "Test User",
+        email: `user-${Date.now()}-${Math.random()}@example.com`,
+        passwordHash: "irrelevant",
+        role: "USER",
+        status: "ACTIVE",
+      },
+    });
+    const category = await db.category.create({
+      data: { name: "Category", slug: `cat-${Date.now()}-${Math.random()}` },
+    });
+    const service = await db.service.create({
+      data: {
+        categoryId: category.id,
+        name: "Test Service",
+        rate: toDecimal128("1.00"),
+        minQuantity: 10,
+        maxQuantity: 10000,
+      },
+    });
+    return { user, service };
+  }
+
+  async function createOrder(
+    userId: string,
+    serviceId: string,
+    overrides: { status: OrderStatus; updatedAtMinutesAgo?: number }
+  ) {
+    const order = await db.order.create({
+      data: {
+        userId,
+        serviceId,
+        target: "https://example.com/profile",
+        quantity: 100,
+        charge: toDecimal128("1.00"),
+        status: overrides.status,
+      },
     });
 
     if (overrides.updatedAtMinutesAgo !== undefined) {
-      // Mongoose's `timestamps: true` overwrites `updatedAt` on `.create()`
-      // and on any `.save()`/`.updateOne()` call unless explicitly told not
-      // to — `timestamps: false` on this one update is required to
-      // backdate it for the test, exactly as production code would need to
-      // avoid doing accidentally.
+      // Prisma's `@updatedAt` overwrites `updatedAt` on every `.update()`
+      // call unless the update is done via a raw query that bypasses it —
+      // a raw `UPDATE` is required to backdate it for the test, exactly as
+      // production code would need to avoid doing accidentally.
       const backdated = new Date(Date.now() - overrides.updatedAtMinutesAgo * 60 * 1000);
-      await Order.updateOne({ _id: order._id }, { $set: { updatedAt: backdated } }, { timestamps: false });
+      await db.$executeRawUnsafe(`UPDATE "Order" SET "updatedAt" = $1 WHERE id = $2`, backdated, order.id);
     }
 
     return order;
@@ -86,7 +103,8 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
   });
 
   it("does not alert on a PROCESSING order that is still fresh", async () => {
-    await createOrder({ status: "PROCESSING", updatedAtMinutesAgo: 1 });
+    const { user, service } = await seedUserAndService();
+    await createOrder(user.id, service.id, { status: "PROCESSING", updatedAtMinutesAgo: 1 });
 
     const result = await checkQueueDepth();
     expect(result.staleProcessingCount).toBe(0);
@@ -94,7 +112,11 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
   });
 
   it("alerts on a PROCESSING order stuck past the stale threshold", async () => {
-    await createOrder({ status: "PROCESSING", updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 5 });
+    const { user, service } = await seedUserAndService();
+    await createOrder(user.id, service.id, {
+      status: "PROCESSING",
+      updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 5,
+    });
 
     const result = await checkQueueDepth();
     expect(result.staleProcessingCount).toBe(1);
@@ -102,8 +124,15 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
   });
 
   it("does not count IN_PROGRESS/COMPLETED orders as stale PROCESSING regardless of age", async () => {
-    await createOrder({ status: "IN_PROGRESS", updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 30 });
-    await createOrder({ status: "COMPLETED", updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 30 });
+    const { user, service } = await seedUserAndService();
+    await createOrder(user.id, service.id, {
+      status: "IN_PROGRESS",
+      updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 30,
+    });
+    await createOrder(user.id, service.id, {
+      status: "COMPLETED",
+      updatedAtMinutesAgo: STALE_PROCESSING_MINUTES + 30,
+    });
 
     const result = await checkQueueDepth();
     expect(result.staleProcessingCount).toBe(0);
@@ -111,8 +140,9 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
   });
 
   it("does not alert on a PENDING backlog at or below the threshold", async () => {
+    const { user, service } = await seedUserAndService();
     for (let i = 0; i < PENDING_BACKLOG_ALERT_THRESHOLD; i++) {
-      await createOrder({ status: "PENDING" });
+      await createOrder(user.id, service.id, { status: "PENDING" });
     }
 
     const result = await checkQueueDepth();
@@ -121,8 +151,9 @@ describe("lib/services/jobs — checkQueueDepth (integration)", () => {
   });
 
   it("alerts once the PENDING backlog exceeds the threshold", async () => {
+    const { user, service } = await seedUserAndService();
     for (let i = 0; i < PENDING_BACKLOG_ALERT_THRESHOLD + 1; i++) {
-      await createOrder({ status: "PENDING" });
+      await createOrder(user.id, service.id, { status: "PENDING" });
     }
 
     const result = await checkQueueDepth();

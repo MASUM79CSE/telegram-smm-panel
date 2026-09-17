@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { compare, hash } from "bcryptjs";
 import { auth } from "@/auth";
-import { connectDB } from "@/lib/db";
-import { User } from "@/models/User";
+import { prisma } from "@/lib/db";
 import { changePasswordSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import { recordAudit } from "@/lib/audit";
@@ -41,9 +40,7 @@ export async function POST(request: Request) {
       );
     }
 
-    await connectDB();
-
-    const user = await User.findById(session.user.id).select("+passwordHash");
+    const user = await prisma.user.findUnique({ where: { id: session.user.id } });
     if (!user || !user.passwordHash) {
       // No password set (e.g. a hypothetical future OAuth-only account) —
       // there is nothing to "change" via this current-password-gated flow.
@@ -55,8 +52,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Current password is incorrect." }, { status: 400 });
     }
 
-    user.passwordHash = await hash(parsed.data.newPassword, 12);
-    await user.save();
+    const newPasswordHash = await hash(parsed.data.newPassword, 12);
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash: newPasswordHash } });
 
     await recordAudit({
       actorId: session.user.id,

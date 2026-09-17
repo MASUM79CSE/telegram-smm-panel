@@ -1,12 +1,14 @@
-import type { HydratedDocument } from "mongoose";
-
-import { Order, type IOrder } from "@/models/Order";
-import { Service } from "@/models/Service";
-import { Provider } from "@/models/Provider";
+import { prisma } from "@/lib/db";
 import { requestProviderRefill } from "@/lib/fulfillment";
 import { AppError } from "@/lib/errors";
+import type { Order, RefillStatus, Prisma } from "@/lib/generated/prisma";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function appendHistory(order: { statusHistory: Prisma.JsonValue }, status: string, note: string, at: Date) {
+  const existing = Array.isArray(order.statusHistory) ? order.statusHistory : [];
+  return [...existing, { status, note, at: at.toISOString() }];
+}
 
 /**
  * Self-service order refill (docs/IMPLEMENTATION_PLAN.md Phase 3.1). Shared
@@ -64,13 +66,16 @@ export function isRefillEligible(order: {
   return Date.now() - completedAtMs <= refillDays * MS_PER_DAY;
 }
 
-export async function requestRefill(orderId: string, userId: string): Promise<HydratedDocument<IOrder>> {
-  const order = await Order.findOne({ _id: orderId, userId });
+export async function requestRefill(orderId: string, userId: string): Promise<Order> {
+  const order = await prisma.order.findFirst({ where: { id: orderId, userId } });
   if (!order) {
     throw new AppError("NOT_FOUND", "Order not found.");
   }
 
-  const service = await Service.findById(order.serviceId).select("refillDays");
+  const service = await prisma.service.findUnique({
+    where: { id: order.serviceId },
+    select: { refillDays: true },
+  });
   if (!service || service.refillDays === null || service.refillDays === undefined) {
     throw new AppError("REFILL_NOT_SUPPORTED", "This service does not support refills.");
   }
@@ -96,39 +101,29 @@ export async function requestRefill(orderId: string, userId: string): Promise<Hy
   }
 
   const now = new Date();
-  order.refillStatus = "REQUESTED";
-  order.refillRequestedAt = now;
-  order.statusHistory.push({ status: order.status, note: "Refill requested by customer", at: now });
+  let refillStatus: RefillStatus = "REQUESTED";
+  let providerRefillId: string | null = null;
+  let history = appendHistory(order, order.status, "Refill requested by customer", now);
 
   if (order.providerId) {
-    // `.select("+apiKeyEncrypted")` alone (NOT combined with any other plain
-    // field name) — mixing a "+field" opt-in token with plain inclusion
-    // field names in one Mongoose `.select()` string switches the whole
-    // query into inclusion-only mode, silently dropping every OTHER field
-    // (including `apiUrl`, which `requestProviderRefill` needs) rather than
-    // just re-including the `select: false` field on top of the full
-    // document. Found live during Phase 3 verification: the original
-    // `.select("+apiKeyEncrypted type")` here caused `provider.apiUrl` to
-    // come back `undefined` even though it was correctly set in the DB,
-    // which made every refill request against a real API provider fail
-    // with "Provider is missing API configuration". Matches the working
-    // pattern already used in `lib/fulfillment.ts#resolveDispatchCandidates`.
-    const provider = await Provider.findById(order.providerId).select("+apiKeyEncrypted");
+    const provider = await prisma.provider.findUnique({ where: { id: order.providerId } });
     if (provider?.type === "API") {
       try {
         const result = await requestProviderRefill(order, provider);
-        order.providerRefillId = result.refillId;
+        providerRefillId = result.refillId;
         // No further automatic tracking of the refill's own progress in this
         // phase (see module doc comment) — mark COMPLETED immediately since
         // the provider accepted the refill request itself; if visibility
         // into refill progress becomes a requirement later, this is the
         // function to extend with a poll, mirroring pollOrderStatus.
-        order.refillStatus = "COMPLETED";
+        refillStatus = "COMPLETED";
       } catch (err) {
-        order.refillStatus = "REJECTED";
         const message = err instanceof Error ? err.message : "Provider refill request failed";
-        order.statusHistory.push({ status: order.status, note: `Refill failed: ${message}`, at: new Date() });
-        await order.save();
+        history = appendHistory({ statusHistory: history }, order.status, `Refill failed: ${message}`, new Date());
+        await prisma.order.update({
+          where: { id: order.id },
+          data: { refillStatus: "REJECTED", refillRequestedAt: now, statusHistory: history },
+        });
         throw new AppError("REFILL_PROVIDER_ERROR", "The provider rejected the refill request.");
       }
     }
@@ -137,8 +132,15 @@ export async function requestRefill(orderId: string, userId: string): Promise<Hy
   // No providerId at all (legacy manually-fulfilled order): also leave as
   // REQUESTED for an admin to action — same fallback as above.
 
-  await order.save();
-  return order;
+  return prisma.order.update({
+    where: { id: order.id },
+    data: {
+      refillStatus,
+      refillRequestedAt: now,
+      providerRefillId,
+      statusHistory: history,
+    },
+  });
 }
 
 /**
@@ -158,10 +160,10 @@ export async function requestRefill(orderId: string, userId: string): Promise<Hy
  */
 export async function resolveManualRefill(
   orderId: string,
-  resolution: Extract<IOrder["refillStatus"], "COMPLETED" | "REJECTED">,
+  resolution: Extract<RefillStatus, "COMPLETED" | "REJECTED">,
   note?: string | null
-): Promise<HydratedDocument<IOrder>> {
-  const order = await Order.findById(orderId);
+): Promise<Order> {
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) {
     throw new AppError("NOT_FOUND", "Order not found.");
   }
@@ -174,13 +176,15 @@ export async function resolveManualRefill(
   }
 
   const now = new Date();
-  order.refillStatus = resolution;
-  order.statusHistory.push({
-    status: order.status,
-    note: note?.trim() ? `Refill ${resolution === "COMPLETED" ? "fulfilled" : "declined"} by admin: ${note.trim()}` : `Refill ${resolution === "COMPLETED" ? "fulfilled" : "declined"} by admin`,
-    at: now,
-  });
+  const noteText = note?.trim()
+    ? `Refill ${resolution === "COMPLETED" ? "fulfilled" : "declined"} by admin: ${note.trim()}`
+    : `Refill ${resolution === "COMPLETED" ? "fulfilled" : "declined"} by admin`;
 
-  await order.save();
-  return order;
+  return prisma.order.update({
+    where: { id: order.id },
+    data: {
+      refillStatus: resolution,
+      statusHistory: appendHistory(order, order.status, noteText, now),
+    },
+  });
 }
