@@ -141,7 +141,41 @@ const authMiddleware = auth((request: NextAuthRequest, event: NextFetchEvent) =>
   // `/` -> `/bn`) is returned as-is, still carrying the CSP header — the
   // browser is about to navigate elsewhere, there's no page to apply a
   // nonce to.
-  return applyCsp(handleI18nRouting(requestWithNonce));
+  //
+  // IMPORTANT — do not pass `requestWithNonce` (or any request object
+  // derived from `request`) straight into `handleI18nRouting` here.
+  // `request` was produced by NextAuth's `auth()` wrapper, which — whenever
+  // NEXTAUTH_URL/AUTH_URL is set, even to the request's own origin — calls
+  // `reqWithEnvURL()` (node_modules/next-auth/lib/env.js) and rebuilds the
+  // request via `new NextRequest(href.replace(origin, envOrigin), req)`
+  // before invoking this middleware function. That reconstruction leaves
+  // the resulting `NextRequest`/`NextURL` in a state that Next.js's own
+  // proxy pipeline (server/web/adapter.js, comparing origins via
+  // shared/lib/router/utils/relativize-url.js) can no longer recognize as
+  // "the same request" it started with. The practical effect: next-intl's
+  // perfectly normal internal rewrite (`/` -> `/en` under `localePrefix:
+  // "as-needed"`) stops being treated as an invisible, same-request
+  // rewrite and instead surfaces as a second, client-visible pass through
+  // middleware — which next-intl then redirects back to `/`, producing an
+  // infinite 307 loop for every request (confirmed via a minimal repro:
+  // the loop reproduces purely from `auth()` wrapping next-intl's
+  // middleware whenever NEXTAUTH_URL/AUTH_URL is set, with no CSP/origin
+  // logic involved, and disappears the moment either that env var is
+  // unset or next-intl is handed a freshly-constructed request instead).
+  //
+  // Building a clean `NextRequest` directly from the plain URL string (not
+  // from `request`/`requestWithNonce`) sidesteps whatever internal state
+  // `reqWithEnvURL`'s reconstruction leaves behind, while still carrying
+  // every header (including the CSP nonce set above) through untouched.
+  const requestForIntl = new NextRequest(
+    new URL(
+      requestWithNonce.nextUrl.pathname + requestWithNonce.nextUrl.search,
+      requestWithNonce.nextUrl.origin
+    ),
+    { headers: requestWithNonce.headers }
+  );
+
+  return applyCsp(handleI18nRouting(requestForIntl));
 });
 
 export function proxy(request: NextRequest, event: NextFetchEvent) {
