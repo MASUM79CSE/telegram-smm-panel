@@ -242,11 +242,11 @@ Remember deposits here are manual-approval, not an automated webhook (see
    acceptable, expected cost.
 2. If it's a code-level auth bypass, the fastest containment is often
    disabling the affected route/feature (feature-flag or quick deploy)
-   while the real fix is prepared and reviewed properly — do not skip
-   the Security Review stage (peer code review focused on
-   auth/authz/injection/secrets handling)
-   for the actual fix just because it's urgent; a rushed, unreviewed
-   security patch is how second bugs get introduced.
+   while the real fix is prepared and reviewed properly — do not skip a
+   proper security review (peer code review focused on
+   auth/authz/injection/secrets handling) for the actual fix just because
+   it's urgent; a rushed, unreviewed security patch is how second bugs
+   get introduced.
 3. Check `AuditLog` and any available request logs for the actual extent
    of exploitation (what was accessed/changed, by whom, in what window)
    before deciding what user-facing disclosure is needed.

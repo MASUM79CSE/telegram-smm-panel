@@ -2,12 +2,12 @@
  * Financial report CSV export helper.
  *
  * Scope note: this module is deliberately limited to the pure,
- * unit-testable CSV-serialization half of a future `/admin/reports` page
- * (see `.claude/plans/financial-report-csv-export.plan.md`). The Mongo
- * aggregation half (pulling per-day revenue/order/refund totals, analogous
- * to `getRevenueSeries` in `lib/services/analytics.ts`) needs a live DB to
- * verify and is intentionally out of scope here, matching this project's
- * existing "pure logic only" unit-test boundary (see `vitest.config.ts`).
+ * unit-testable CSV-serialization half of a future `/admin/reports` page.
+ * The DB aggregation half (pulling per-day revenue/order/refund totals,
+ * analogous to `getRevenueSeries` in `lib/services/analytics.ts`) needs a
+ * live DB to verify and is intentionally out of scope here, matching this
+ * project's existing "pure logic only" unit-test boundary (see
+ * `vitest.config.ts`).
  */
 
 export interface FinancialReportRow {

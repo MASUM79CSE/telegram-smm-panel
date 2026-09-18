@@ -40,17 +40,11 @@ const nextConfig: NextConfig = {
       "docs/**",
       "MEMORY.md",
       "CHANGELOG.md",
-      "CLAUDE.md",
-      "AGENTS.md",
       "README.md",
       // Build/tooling artifacts and lockfiles — never needed at runtime.
       "tsconfig.tsbuildinfo",
       "package-lock.json",
       ".git/**",
-      // Everything Claude Code (ECC) vendor/tooling — dev-only, large.
-      ".claude/**",
-      ".ecc-vendor/**",
-      ".agents/**",
       // Test suites and e2e fixtures — never imported by production code.
       "**/__tests__/**",
       "e2e/**",

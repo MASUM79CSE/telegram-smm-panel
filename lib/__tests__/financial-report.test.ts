@@ -2,11 +2,10 @@ import { describe, it, expect } from "vitest";
 import { toFinancialReportCsv, type FinancialReportRow } from "@/lib/services/financial-report";
 
 /**
- * ECC TDD-workflow demonstration (see docs/ECC_SETUP.md §"Emulated
- * pipeline run" / .claude/plans/financial-report-csv-export.plan.md).
- * Written BEFORE lib/services/financial-report.ts exists — this file is
- * expected to fail with a module-not-found error until the implementation
- * lands (RED), then pass once it does (GREEN).
+ * Written BEFORE lib/services/financial-report.ts existed, as a TDD
+ * (test-first) exercise — this file was expected to fail with a
+ * module-not-found error until the implementation landed (RED), then
+ * pass once it did (GREEN). Kept as a normal regression test going forward.
  */
 describe("lib/services/financial-report", () => {
   describe("toFinancialReportCsv", () => {

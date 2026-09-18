@@ -13,8 +13,7 @@ name: Cron (production background jobs)
 # only supports once-per-day schedules (imprecise, within-the-hour) on the
 # free Hobby plan — per-minute schedules require a Pro plan ($20/mo). This
 # project stays on Hobby and uses this repo's own CI infrastructure as the
-# external scheduler instead. Trade-off, accepted deliberately (see
-# .claude/plans/production-hardening-observability-cd.plan.md): GitHub
+# external scheduler instead. Trade-off, accepted deliberately: GitHub
 # Actions' `schedule` trigger has a documented 5-minute minimum interval,
 # is best-effort (can be delayed, especially near common cron boundaries
 # like the top of the hour — schedules below are deliberately offset to

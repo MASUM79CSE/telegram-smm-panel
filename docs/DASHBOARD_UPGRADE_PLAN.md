@@ -424,9 +424,9 @@ verification discipline.
   Live-verified via Playwright screenshot: opened via keyboard shortcut,
   typed a query, saw the matching user result render correctly.
 - ✅ **2.3 bulk actions on Orders/Users/Payments tables** — delivered
-  following the full ECC pipeline (Plan → TDD → Implement → Code Review →
-  Security Review → Repair → Ship; see `.claude/plans/admin-bulk-actions.plan.md`
-  and `MEMORY.md` for the per-stage record). Row checkboxes + "select all
+  following a full Plan → TDD → Implement → Code Review → Security Review →
+  Repair → Ship workflow (see `MEMORY.md` for the per-stage record). Row
+  checkboxes + "select all
   on page" on all three tables. Orders: bulk status change restricted to
   `CANCELED`/`FAILED` only (enforced at both the zod schema and service
   layer — `REFUNDED`/`COMPLETED` stay single-item, individually-reviewed

@@ -12,11 +12,6 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
-    // Vendored Everything Claude Code (ECC) install — third-party agent/
-    // skill/tooling content, not this project's application code. See
-    // docs/ECC_SETUP.md.
-    ".claude/**",
-    ".ecc-vendor/**",
   ]),
 ]);
 
