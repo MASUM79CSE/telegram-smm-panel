@@ -19,6 +19,54 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // Prisma's bundled `dotenv` dependency does an unscoped
+  // `fs.existsSync(path.join(process.cwd(), ".env.vault"))` check (and a
+  // similar one for `.env`) at require-time. Turbopack's file-tracer can't
+  // statically scope that path, so — per its own documented behavior — it
+  // falls back to tracing the ENTIRE project into every server function
+  // that touches Prisma (i.e. almost every API route here). Verified
+  // locally: without this, each of this project's ~90 route functions
+  // pulled in ~530 files / ~26MB, including things that must never ship in
+  // a deployed function bundle at all (repo docs, markdown, lockfiles,
+  // .tsbuildinfo, and Prisma query-engine binaries/wasm for platforms this
+  // deployment doesn't run on) — a real contributor to (and very plausibly
+  // the actual cause of) Vercel function-size/build failures, not just a
+  // cosmetic warning. `outputFileTracingExcludes` is the documented
+  // opt-out for exactly this "tracer over-included files" case (see
+  // https://nextjs.org/docs/app/api-reference/config/next-config-js/output).
+  outputFileTracingExcludes: {
+    "*": [
+      // Repo docs/notes — never needed at runtime.
+      "docs/**",
+      "MEMORY.md",
+      "CHANGELOG.md",
+      "CLAUDE.md",
+      "AGENTS.md",
+      "README.md",
+      // Build/tooling artifacts and lockfiles — never needed at runtime.
+      "tsconfig.tsbuildinfo",
+      "package-lock.json",
+      ".git/**",
+      // Everything Claude Code (ECC) vendor/tooling — dev-only, large.
+      ".claude/**",
+      ".ecc-vendor/**",
+      ".agents/**",
+      // Test suites and e2e fixtures — never imported by production code.
+      "**/__tests__/**",
+      "e2e/**",
+      // Prisma ships query-engine binaries/wasm for every platform under
+      // `generator client`'s binaryTargets; only the one actually running
+      // in production (native `debian-openssl-3.0.x`, matching Vercel's
+      // Amazon Linux runtime) is needed. Excluding the wasm fallback engine
+      // (~2.2MB) and any other-platform binaries alone saves real space
+      // across all ~90 functions. Left the actual runtime library files
+      // (runtime/library.js etc.) untouched since those ARE needed.
+      "lib/generated/prisma/query_engine_bg.wasm",
+      "lib/generated/prisma/runtime/*-wasm*.js",
+      "lib/generated/prisma/runtime/react-native.js",
+      "lib/generated/prisma/runtime/index-browser.js",
+    ],
+  },
   async headers() {
     return [
       {
