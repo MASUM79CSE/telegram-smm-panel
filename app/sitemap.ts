@@ -1,5 +1,4 @@
 import type { MetadataRoute } from "next";
-import { env } from "@/lib/env";
 import { prisma } from "@/lib/db";
 import { logger } from "@/lib/logger";
 
@@ -36,7 +35,17 @@ import { logger } from "@/lib/logger";
 export const dynamic = "force-dynamic";
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-  const baseUrl = env.NEXT_PUBLIC_APP_URL;
+  // Reads process.env directly rather than the shared `env` object from
+  // lib/env.ts for the same reason as app/robots.ts: that object validates
+  // the FULL env schema (DATABASE_URL, AUTH_SECRET, etc.) on first property
+  // access, and this route has no legitimate need for any of those to
+  // render its own base URL. `dynamic = "force-dynamic"` above currently
+  // keeps this route from being prerendered at build time (so it wasn't
+  // actually hit by the same build-time failure app/robots.ts was), but
+  // that's a fragile single point of protection against a config change
+  // silently reintroducing the same class of bug — reading the var
+  // directly removes the sharp edge entirely regardless.
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
   const now = new Date();
 
   const staticEntries: MetadataRoute.Sitemap = [
