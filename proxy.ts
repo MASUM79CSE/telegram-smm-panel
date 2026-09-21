@@ -73,6 +73,16 @@ function withHeaders(request: NextRequest, extra: Record<string, string>): NextR
   return new NextRequest(request, { headers });
 }
 
+/**
+ * Internal-only header used to smuggle the request's TRUE origin (as seen
+ * by Next.js's own server, before NextAuth's `auth()` wrapper touches it)
+ * from the outer `proxy()` export down into the `auth()`-wrapped inner
+ * middleware below. See the long comment above `requestForIntl` for why
+ * this is necessary. Stripped before any response headers are sent, so it
+ * never leaks to the client or to route handlers.
+ */
+const ORIGINAL_ORIGIN_HEADER = "x-internal-original-origin";
+
 const authMiddleware = auth((request: NextAuthRequest, event: NextFetchEvent) => {
   void event;
   const nonce = generateNonce();
@@ -90,6 +100,14 @@ const authMiddleware = auth((request: NextAuthRequest, event: NextFetchEvent) =>
     response.headers.set(REQUEST_ID_HEADER, requestId);
     return response;
   };
+
+  // Read before any header mutation below — this is the origin NextAuth's
+  // `reqWithEnvURL()` stamped onto the incoming request via
+  // `ORIGINAL_ORIGIN_HEADER` in the outer `proxy()` export, i.e. the origin
+  // Next.js's own dev/proxy server actually considers "itself" for this
+  // request (its bind host/port, or whatever the real client-facing Host
+  // was). See the long comment above `requestForIntl` further down.
+  const originalOrigin = request.headers.get(ORIGINAL_ORIGIN_HEADER) ?? request.nextUrl.origin;
 
   const requestWithId = withHeaders(request, { [REQUEST_ID_HEADER]: requestId });
 
@@ -143,34 +161,40 @@ const authMiddleware = auth((request: NextAuthRequest, event: NextFetchEvent) =>
   // nonce to.
   //
   // IMPORTANT — do not pass `requestWithNonce` (or any request object
-  // derived from `request`) straight into `handleI18nRouting` here.
-  // `request` was produced by NextAuth's `auth()` wrapper, which — whenever
-  // NEXTAUTH_URL/AUTH_URL is set, even to the request's own origin — calls
-  // `reqWithEnvURL()` (node_modules/next-auth/lib/env.js) and rebuilds the
-  // request via `new NextRequest(href.replace(origin, envOrigin), req)`
-  // before invoking this middleware function. That reconstruction leaves
-  // the resulting `NextRequest`/`NextURL` in a state that Next.js's own
-  // proxy pipeline (server/web/adapter.js, comparing origins via
-  // shared/lib/router/utils/relativize-url.js) can no longer recognize as
-  // "the same request" it started with. The practical effect: next-intl's
-  // perfectly normal internal rewrite (`/` -> `/en` under `localePrefix:
-  // "as-needed"`) stops being treated as an invisible, same-request
-  // rewrite and instead surfaces as a second, client-visible pass through
-  // middleware — which next-intl then redirects back to `/`, producing an
-  // infinite 307 loop for every request (confirmed via a minimal repro:
-  // the loop reproduces purely from `auth()` wrapping next-intl's
-  // middleware whenever NEXTAUTH_URL/AUTH_URL is set, with no CSP/origin
-  // logic involved, and disappears the moment either that env var is
-  // unset or next-intl is handed a freshly-constructed request instead).
+  // derived straight from `request`) into `handleI18nRouting` here without
+  // first correcting its origin. `request` was produced by NextAuth's
+  // `auth()` wrapper, which — whenever NEXTAUTH_URL/AUTH_URL is set, even
+  // to the request's own origin — calls `reqWithEnvURL()`
+  // (node_modules/next-auth/lib/env.js) and unconditionally rebuilds the
+  // request via `new NextRequest(href.replace(origin, envOrigin), req)`,
+  // swapping in NEXTAUTH_URL/AUTH_URL's origin.
   //
-  // Building a clean `NextRequest` directly from the plain URL string (not
-  // from `request`/`requestWithNonce`) sidesteps whatever internal state
-  // `reqWithEnvURL`'s reconstruction leaves behind, while still carrying
-  // every header (including the CSP nonce set above) through untouched.
+  // Next.js's own dev/proxy server (server/lib/router-utils/resolve-routes.js
+  // `initUrl`, compared via server/web/adapter.js + relativize-url.js)
+  // independently computes what it considers this request's "true" origin
+  // — from its bind hostname/port (or `experimental.trustHostHeader`'s
+  // Host-header logic), NOT from NEXTAUTH_URL/AUTH_URL. Whenever that
+  // differs from the swapped-in origin (e.g. dev server bound to
+  // `0.0.0.0`/a sandboxed preview hostname while NEXTAUTH_URL says
+  // `localhost:3000`; or any real deployment behind a reverse proxy with a
+  // public hostname that legitimately differs from an internal one), the
+  // rewrite target next-intl returns no longer matches what Next.js
+  // expects, so its "is this an internal, same-origin rewrite" check fails
+  // and next-intl's normal `/` -> `/en` (as-needed) rewrite leaks out as a
+  // second, client-visible middleware pass — which next-intl then
+  // redirects back to `/`, producing an infinite 307 loop.
+  //
+  // Fix: build a clean `NextRequest` for next-intl using `originalOrigin`
+  // (captured in the outer `proxy()` export BEFORE `auth()` ever touched
+  // the request, i.e. before `reqWithEnvURL`'s swap) instead of whatever
+  // origin `request`/`requestWithNonce` currently carries. This makes
+  // next-intl's rewrite target match what Next.js's own server considers
+  // "itself", regardless of whether NEXTAUTH_URL/AUTH_URL happens to equal,
+  // differ from, or be entirely absent relative to the bind/proxy origin.
   const requestForIntl = new NextRequest(
     new URL(
       requestWithNonce.nextUrl.pathname + requestWithNonce.nextUrl.search,
-      requestWithNonce.nextUrl.origin
+      originalOrigin
     ),
     { headers: requestWithNonce.headers }
   );
@@ -179,7 +203,15 @@ const authMiddleware = auth((request: NextAuthRequest, event: NextFetchEvent) =>
 });
 
 export function proxy(request: NextRequest, event: NextFetchEvent) {
-  return authMiddleware(request, event);
+  // Stamp the request's origin as Next.js's own server sees it RIGHT NOW,
+  // before `auth()` gets a chance to run `reqWithEnvURL()` and swap it for
+  // NEXTAUTH_URL/AUTH_URL's origin. See the long comment above
+  // `requestForIntl` inside `authMiddleware` for the full explanation of
+  // why this is necessary to avoid an infinite redirect loop.
+  const requestWithOriginalOrigin = withHeaders(request, {
+    [ORIGINAL_ORIGIN_HEADER]: request.nextUrl.origin,
+  });
+  return authMiddleware(requestWithOriginalOrigin, event);
 }
 
 export const config = {
